@@ -1,0 +1,9 @@
+build/
+src/modem/v8/v8build/
+*.o
+*.a
+*.so
+*.db
+__pycache__/
+*.pyc
+src/modem/v34/v34build/
