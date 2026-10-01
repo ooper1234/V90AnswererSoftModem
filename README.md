@@ -157,8 +157,6 @@ If the modem connects but receives no data, check the server's per-call
 logs (`/tmp/v90` in the container), its PPP child log, and the AudioSocket
 address/port. Ensure that the daemon is running in PPP mode. If DNS fails,
 check the client's manual DNS setting and the server's internet access.
-To hear a handshake, Asterisk must record/monitor the local modem extension;
-a Listen script cannot hear calls that bypass its recording route.
 
 ## License and credits
 
