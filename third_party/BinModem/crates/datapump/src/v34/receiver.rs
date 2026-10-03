@@ -1202,7 +1202,15 @@ impl Receiver {
         let outputs_at = |receiver: &Self, moved: f64| -> Option<Vec<Complex>> {
             let read: Vec<Complex> =
                 (0..count).map(|m| receiver.interpolate(start_time + m as f64 * half + moved)).collect::<Option<_>>()?;
-            Some((0..DENSE_WINDOW).map(|j| apply(&receiver.taps, &read[2 * j + 1..2 * j + 2 + 2 * REACH])).collect())
+            Some((0..DENSE_WINDOW).map(|j| {
+                let point = apply(&receiver.taps, &read[2 * j + 1..2 * j + 2 + 2 * REACH]);
+                // Fit all points at the next symbol's carrier epoch. A
+                // constant fit over uncorrected rotating points confuses
+                // frequency offset with a damaged dense constellation.
+                let centre = first_centre + 2 * j as u64;
+                let ahead = (receiver.next_symbol - centre) as f64 / 2.0;
+                point * Complex::from_polar(1.0, receiver.turn * ahead)
+            }).collect())
         };
         let mse = |outputs: &[Complex], c: Complex| {
             outputs.iter().map(|y| (*y * c - self.slicer.decide(*y * c).1).norm_sqr()).sum::<f64>() / outputs.len() as f64
@@ -1261,13 +1269,13 @@ impl Receiver {
         for tap in &mut self.taps {
             *tap = tap.scale(gain);
         }
-        self.take_up(from, moved, -c.arg(), DENSE_WINDOW);
+        self.take_up(from, moved, -c.arg(), 0.0);
     }
 
     /// Carry on from a resync: every half symbol from `from` read again
     /// `moved` samples later, and the carrier's phase `turned` at the middle
-    /// of the `window` symbols it was judged over.
-    fn take_up(&mut self, from: u64, moved: f64, turned: f64, window: usize) {
+    /// of its window, advanced by `phase_advance` symbols.
+    fn take_up(&mut self, from: u64, moved: f64, turned: f64, phase_advance: f64) {
         let redo = (from - self.first) as usize;
         let mut keep = self.halves.len();
         for m in redo..self.halves.len() {
@@ -1291,7 +1299,7 @@ impl Receiver {
         } else {
             self.due += moved;
         }
-        self.rotation = (turned + self.turn * (window as f64 / 2.0)).rem_euclid(std::f64::consts::TAU);
+        self.rotation = (turned + self.turn * phase_advance).rem_euclid(std::f64::consts::TAU);
         self.lost = None;
         self.recent.clear();
         self.slips += 1;
@@ -1369,7 +1377,7 @@ impl Receiver {
         // Found. Everything from the window on is read again on the moved
         // grid, and anything the moved grid needs samples for that have not
         // come yet is made again when they have.
-        self.take_up(from, shift * half, turned, window);
+        self.take_up(from, shift * half, turned, window as f64 / 2.0);
     }
 }
 
@@ -1623,6 +1631,52 @@ mod tests {
     /// Phase 3 and then phase 4 from one answer modem: TRN in phase 4 at
     /// sixteen points, from a scrambler restarted at zero if `restarted` and
     /// carried on from J if not.
+    #[test]
+    fn dense_recovery_tracks_carrier_rotation_across_its_window() {
+        for turn in [-0.003, 0.003] {
+            let mut rx = Receiver::new(Band::new(SymbolRate::S3200, false), 32000.0);
+            // Isolate carrier recovery from the front-end filter: interpolate
+            // a known dense symbol grid exactly at its sampling instants.
+            rx.table.fill(0.0);
+            for ph in 0..FILTER_PHASES {
+                let row = &mut rx.table[ph * FILTER_TAPS..(ph + 1) * FILTER_TAPS];
+                let fraction = ph as f64 / FILTER_PHASES as f64;
+                row[FILTER_TAPS / 2 - 1] = 1.0 - fraction;
+                row[FILTER_TAPS / 2] = fraction;
+            }
+            let mut seed = 12345u32;
+            let points: Vec<Complex> = (0..301).map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let re = (2 * ((seed >> 16) % 32) as i32 - 31) as f64 / 32.0;
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let im = (2 * ((seed >> 16) % 32) as i32 - 31) as f64 / 32.0;
+                Complex::new(re, im)
+            }).collect();
+            rx.history = (0..3000).map(|sample| {
+                let symbol = sample as f64 / 10.0;
+                let at = symbol.floor() as usize;
+                let fraction = symbol - at as f64;
+                (points[at].scale(1.0 - fraction) + points[at + 1].scale(fraction))
+                    * Complex::from_polar(1.0, 0.21 + turn * symbol)
+            }).collect();
+            rx.taken = 3000;
+            rx.times = (0..500).map(|i| i as f64 * rx.half).collect();
+            rx.halves = rx.times.iter().map(|&t| rx.interpolate(t).unwrap_or(Complex::ZERO)).collect();
+            rx.made = 500;
+            rx.next_symbol = 320;
+            rx.due = 2500.0;
+            rx.turn = turn;
+            rx.rotation = 0.21 + turn * 160.0;
+            rx.slicer = Slicer::Grid { scale: 32.0, limit: 31 };
+            rx.data_mode = true;
+            rx.settled = 1e-6;
+            rx.lost = Some(10);
+            rx.resync_dense();
+            assert!(!rx.is_lost(), "dense carrier recovery failed at turn {turn}");
+            let error = angle_between(rx.rotation, 0.21 + turn * 160.0);
+            assert!(error < 0.001, "recovered phase lagged the next symbol by {error} radians");
+        }
+    }
     fn phases_3_and_4(band: Band, restarted: bool) -> Vec<f64> {
         let mut tx = Transmitter::new(band, 0, 0, FS);
         let mut sender = Sender::new(Mode::Answer);

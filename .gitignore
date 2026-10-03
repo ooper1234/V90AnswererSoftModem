@@ -7,3 +7,6 @@ src/modem/v8/v8build/
 __pycache__/
 *.pyc
 src/modem/v34/v34build/
+
+scripts/multilink/server.json
+scripts/multilink/client.json

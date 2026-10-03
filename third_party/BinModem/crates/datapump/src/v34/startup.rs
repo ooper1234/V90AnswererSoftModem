@@ -3,6 +3,18 @@
 
 use super::phase2::{self, Role};
 use super::training::{self, Settings};
+use dsp::Resampler;
+use std::collections::VecDeque;
+
+#[derive(Debug, Clone)]
+struct TrainingRate {
+    fs: f64,
+    up: Resampler,
+    down: Resampler,
+    input: Vec<f64>,
+    output: Vec<f64>,
+    pending: VecDeque<f64>,
+}
 
 /// Retrains in a row that phase 2 may ask for before its failure is taken as
 /// the end of the call.
@@ -42,6 +54,7 @@ pub struct Modem {
     fs: f64,
     phase2: phase2::Modem,
     training: Option<training::Modem>,
+    training_rate: Option<TrainingRate>,
     /// Set while a retrain is under way: phase 2 is running again after a call
     /// was up, so the call is recovering rather than being placed. Cleared
     /// when the new phases 3 and 4 connect.
@@ -68,10 +81,33 @@ impl Modem {
             fs,
             phase2,
             training: None,
+            training_rate: None,
             retraining: false,
             retrains: 0,
             phase2_retrains: 0,
             training_retrains: 0,
+        }
+    }
+
+    /// Keep phase 2 at the line rate while phases 3/4 and V.34 data run at
+    /// the same internal rate as the standalone V.34 engine.
+    pub fn with_training_rate(mut self, fs: f64) -> Self {
+        assert!(self.training.is_none());
+        if fs != self.fs {
+            self.training_rate = Some(TrainingRate { fs,
+                up: Resampler::new(self.fs, fs), down: Resampler::new(fs, self.fs),
+                input: Vec::new(), output: Vec::new(), pending: VecDeque::new() });
+        }
+        self
+    }
+
+    fn reset_training_rate(&mut self) {
+        if let Some(rate) = &mut self.training_rate {
+            rate.up = Resampler::new(self.fs, rate.fs);
+            rate.down = Resampler::new(rate.fs, self.fs);
+            rate.input.clear();
+            rate.output.clear();
+            rate.pending.clear();
         }
     }
 
@@ -195,6 +231,7 @@ impl Modem {
     pub fn restart_phase2(&mut self) {
         self.phase2 = self.phase2.again();
         self.training = None;
+        self.reset_training_rate();
         self.retraining = true;
         self.retrains += 1;
     }
@@ -202,7 +239,17 @@ impl Modem {
     /// Carry the start-up one sample further.
     pub fn step(&mut self, line: f64) -> f64 {
         if let Some(training) = self.training.as_mut() {
-            let out = training.step(line);
+            let out = if let Some(rate) = &mut self.training_rate {
+                rate.input.clear();
+                rate.up.process(line, &mut rate.input);
+                for sample in &rate.input {
+                    let output = training.step(*sample);
+                    rate.output.clear();
+                    rate.down.process(output, &mut rate.output);
+                    rate.pending.extend(&rate.output);
+                }
+                rate.pending.pop_front().unwrap_or(0.0)
+            } else { training.step(line) };
             if training.take_retrain() {
                 // 11.5: go back to phase 2, keeping the capabilities the first
                 // start-up settled -- a retrain does not exchange INFO0 again.
@@ -210,6 +257,7 @@ impl Modem {
                 // the data with no gap the far end has to wait through.
                 self.phase2 = self.phase2.again();
                 self.training = None;
+                self.reset_training_rate();
                 self.retraining = true;
                 self.retrains += 1;
                 return self.phase2.step(line);
@@ -223,6 +271,7 @@ impl Modem {
             {
                 self.phase2 = self.phase2.again();
                 self.training = None;
+                self.reset_training_rate();
                 self.retraining = true;
                 self.retrains += 1;
                 self.training_retrains += 1;
@@ -252,7 +301,8 @@ impl Modem {
             return out;
         }
         if self.phase2.status() == phase2::Status::Done {
-            self.training = self.settings().map(|settings| training::Modem::new(settings, self.fs));
+            let fs = self.training_rate.as_ref().map_or(self.fs, |rate| rate.fs);
+            self.training = self.settings().map(|settings| training::Modem::new(settings, fs));
         }
         out
     }

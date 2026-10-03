@@ -905,7 +905,10 @@ impl Stack {
                 self.note(true, true, &body);
                 queued = true;
             }
-            while let Some((frame, kind)) = self.lapm.poll_transmit() {
+            // Keep the HDLC backlog to one frame. Draining the whole LAPM
+            // window here delays acknowledgements behind seconds of data
+            // at V.34 rates and starts timers before those frames reach wire.
+            if let Some((frame, kind)) = self.lapm.poll_transmit() {
                 let body = frame.encode(DLCI_DATA, self.role, kind);
                 self.encoder.frame(&body);
                 self.note(true, true, &body);
@@ -1173,6 +1176,7 @@ impl Stack {
                 Event::Connected => {
                     self.established = true;
                     if let Some(compression) = self.compression.as_mut() {
+                        self.lapm.discard_pending();
                         compression.reinitialize();
                     }
                 }
@@ -1181,6 +1185,7 @@ impl Stack {
                 // built from has a hole in it and they have to start again.
                 Event::Reset => {
                     if let Some(compression) = self.compression.as_mut() {
+                        self.lapm.discard_pending();
                         compression.reinitialize();
                     }
                 }

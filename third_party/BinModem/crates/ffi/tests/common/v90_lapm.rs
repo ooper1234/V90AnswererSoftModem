@@ -24,6 +24,14 @@ extern "C" fn put_bit(user: *mut c_void, bit: c_int) {
 enum Far { V8(v8line::Modem), Data(Analogue) }
 
 pub fn run(peer_compression: bool, enable_compression: bool) {
+    run_mode(peer_compression, enable_compression, false);
+}
+
+pub fn run_fallback() {
+    run_mode(true, true, true);
+}
+
+fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool) {
     // The default V.90 path must negotiate error control without a bench hook.
     unsafe {
         std::env::remove_var("V90_ERROR_CONTROL");
@@ -38,7 +46,9 @@ pub fn run(peer_compression: bool, enable_compression: bool) {
     let ptr = &mut dte as *mut Dte as *mut c_void;
     let end = bm_create_v90(1, Some(get_bit), ptr, Some(put_bit), ptr);
     assert!(!end.is_null());
-    let mut net = Network::new(Law::Mu, 16_000.0).with_delay(0.015, 16_000.0).with_noise(1e-5);
+    let mut net = Network::new(Law::Mu, 16_000.0).with_delay(0.015, 16_000.0)
+        .with_noise(1e-5);
+    let mut noise_state = 3490u32;
     let mut far = Far::V8(v8line::Modem::new(v8line::Role::Calling,
         CallFunction::Data, Modulations::of(&[Modulation::V34Duplex]), 16_000.0)
         .offering_pcm(Pcm::ANALOGUE).offering_lapm());
@@ -67,7 +77,13 @@ pub fn run(peer_compression: bool, enable_compression: bool) {
         uplink.clear();
         let output = bm_step(end, (input * 32768.0).round().clamp(-32768.0, 32767.0) as c_int);
         assert_ne!(bm_status(end), BM_FAILED);
-        for input in net.down(output as f64 / 32768.0) {
+        for mut input in net.down(output as f64 / 32768.0) {
+            // Disrupt only initial V.90 training, then allow clean fallback
+            // data. Persistent noise would test a different line condition.
+            if fallback && (8 * 8000..18 * 8000).contains(&tick) {
+                noise_state = noise_state.wrapping_mul(1664525).wrapping_add(1013904223);
+                input += ((noise_state >> 16) as f64 / 65535.0 - 0.5) * 0.067;
+            }
             match &mut far {
                 Far::V8(m) => {
                     uplink.push(0.3 * m.step(input));
@@ -116,13 +132,23 @@ pub fn run(peer_compression: bool, enable_compression: bool) {
     let compression = bm_compression(end);
     let rate = bm_rate_tx(end);
     let upstream_rate = bm_rate_rx(end);
+    let phase = unsafe { std::ffi::CStr::from_ptr(bm_phase(end)) }.to_string_lossy().into_owned();
     bm_destroy(end);
     assert!(far_lapm, "the digital V.90 modem did not advertise its enabled LAPM");
     assert!(connected, "V.90/LAPM never opened the DTE gate");
     assert_ne!(lapm, 0);
     assert_eq!(compression, i32::from(peer_compression && enable_compression), "negotiated V.42bis");
-    assert!(rate >= 48_000);
-    assert_eq!(upstream_rate, 33_600, "full-rate V.90 upstream");
+    if fallback {
+        assert!(rate <= 33_600 && upstream_rate <= 33_600);
+        assert!(matches!(&far, Far::Data(m) if !m.is_v90()), "caller did not select V.34");
+        assert!(phase.starts_with("V.34 data / V.42 / V.42bis"), "wrong fallback phase: {phase}");
+    } else if std::env::var("V90_UP_RATE").as_deref() == Ok("28800") {
+        assert!(rate >= 48_000);
+        assert_eq!(upstream_rate, 28_800, "configured V.90 upstream cap");
+    } else {
+        assert!(rate >= 48_000);
+        assert_eq!(upstream_rate, 33_600, "full-rate V.90 upstream");
+    }
     assert_eq!(got_down, down, "downstream bytes");
     assert_eq!(got_up, up, "upstream bytes");
 }

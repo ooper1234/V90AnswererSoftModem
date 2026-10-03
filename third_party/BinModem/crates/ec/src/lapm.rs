@@ -363,6 +363,12 @@ impl Lapm {
         self.pending.iter().map(Vec::len).sum()
     }
 
+    /// Compression reinitialization invalidates already encoded octets that
+    /// have not reached the serializer, just as it invalidates unacked data.
+    pub fn discard_pending(&mut self) {
+        self.pending.clear();
+    }
+
     /// Queue data for the peer. Split to fit N401 (V.42 9.2.3).
     pub fn send_data(&mut self, data: &[u8]) {
         for chunk in data.chunks(self.params.n401) {
@@ -622,6 +628,11 @@ impl Lapm {
         self.peer_busy = true;
         self.resolve_timer_recovery(pf, kind);
         self.answer_poll(pf, kind);
+        // Busy must remain timed even when all I frames were acknowledged:
+        // the peer's later RR can be lost, leaving pending data stuck forever.
+        if self.timer.is_none() {
+            self.start_timer();
+        }
     }
 
     /// Act on the reply to a timer-recovery poll (V.42 8.5.3).
@@ -634,7 +645,7 @@ impl Lapm {
         }
         self.timer_recovery = false;
         self.retries = 0;
-        if self.va != self.vs {
+        if self.va != self.vs && !self.peer_busy {
             self.retransmit_from(self.va);
         }
     }
@@ -661,6 +672,7 @@ impl Lapm {
         if !in_window(self.va, nr, self.vs) {
             return;
         }
+        let previous = self.va;
         while self.va != nr {
             self.unacked.pop_front();
             self.va = (self.va + 1) % MODULUS;
@@ -669,11 +681,15 @@ impl Lapm {
             // Everything is acknowledged, so nothing is outstanding to time.
             self.stop_timer();
             self.retries = 0;
-        } else {
+        } else if self.va != previous {
             // Some of them were acknowledged and others were not, so the
             // oldest outstanding frame is a different and later one: the wait
             // being measured is its wait, not the retired frame's.
             self.awaiting_ms = None;
+            self.start_timer();
+        } else if self.timer.is_none() {
+            // A duplicate N(R) is not progress. Keep the oldest frame's
+            // existing deadline so repeated RR cannot suppress recovery.
             self.start_timer();
         }
     }
@@ -700,12 +716,13 @@ impl Lapm {
         self.start_timer();
     }
 
-    /// Send whatever the window allows, then any outstanding acknowledgement.
+    /// Hand off one frame at a time. Frames still waiting for the serializer
+    /// must not consume the transmit window or start acknowledgement timers.
     fn pump(&mut self) {
-        if self.state != State::Connected {
+        if self.state != State::Connected || !self.out.is_empty() {
             return;
         }
-        while !self.peer_busy
+        if !self.peer_busy
             && !self.pending.is_empty()
             && outstanding(self.va, self.vs) < self.params.k
         {
@@ -734,6 +751,7 @@ impl Lapm {
     }
 
     fn reset_variables(&mut self) {
+        self.out.clear();
         self.vs = 0;
         self.va = 0;
         self.vr = 0;
@@ -819,6 +837,21 @@ mod tests {
             Lapm::new(Role::Originator, DLCI_DATA, Params::default()),
             Lapm::new(Role::Answerer, DLCI_DATA, Params::default()),
         )
+    }
+
+    #[test]
+    fn queued_bulk_data_does_not_delay_the_next_acknowledgement() {
+        let (mut a, mut b) = pair();
+        a.connect();
+        settle(&mut a, &mut b);
+        a.send_data(&vec![0x5a; DEFAULT_N401 * DEFAULT_K as usize]);
+        let (first, _) = a.poll_transmit().unwrap();
+        assert!(matches!(first, Frame::I { ns: 0, nr: 0, .. }));
+        assert_eq!(a.vs, 1, "unsent frames consumed the whole transmit window");
+        a.receive(Frame::I { ns: 0, nr: 0, poll: false, info: vec![0x42] }, Kind::Command);
+        let (next, _) = a.poll_transmit().unwrap();
+        assert!(matches!(next, Frame::I { nr: 1, .. } | Frame::Rr { nr: 1, .. }),
+            "received data was not acknowledged in the next frame: {next:?}");
     }
 
     /// Move every queued frame from `from` to `to`, returning how many crossed.
@@ -1066,6 +1099,37 @@ mod tests {
             b"abcde",
             "go-back-N should have replaced the lost frame"
         );
+    }
+
+    #[test]
+    fn duplicate_acknowledgements_cannot_postpone_loss_recovery_forever() {
+        let (mut a, mut b) = pair();
+        a.connect();
+        settle(&mut a, &mut b);
+        a.send_data(b"lost data");
+        while a.poll_transmit().is_some() {} // lose the I frame
+        let timeout = a.t401_ms();
+        for _ in 0..4 {
+            a.tick(timeout / 4 + 1);
+            a.receive(Frame::Rr { nr: 0, pf: false }, Kind::Response);
+        }
+        assert!(a.timer_recovery, "duplicate RR kept restarting the loss timer");
+        settle(&mut a, &mut b);
+        assert_eq!(data_from(&mut b), b"lost data");
+    }
+
+    #[test]
+    fn a_lost_ready_notification_is_recovered_by_polling_a_busy_peer() {
+        let (mut a, mut b) = pair();
+        a.connect();
+        settle(&mut a, &mut b);
+        a.receive(Frame::Rnr { nr: 0, pf: false }, Kind::Command);
+        a.send_data(b"resume data");
+        while a.poll_transmit().is_some() {}
+        // The peer is ready again, but its unsolicited RR was lost.
+        a.tick(a.t401_ms() + 1);
+        settle(&mut a, &mut b);
+        assert_eq!(data_from(&mut b), b"resume data");
     }
 
     #[test]

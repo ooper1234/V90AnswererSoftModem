@@ -1,7 +1,7 @@
 #ifndef BM_ANSWERER_H
 #define BM_ANSWERER_H
 
-/* The BinModem V.34 answerer (Rust, third_party/BinModem/crates/ffi), as the
+/* The BinModem answerer (Rust, third_party/BinModem/crates/ffi), as the
    daemon sees it: one line sample at a time in and out at 8 kHz, plus a bit
    interface identical in shape to spanDSP's get_bit/put_bit -- the C side
    frames DTE bytes itself (sm_bitq) and deframes recovered bits itself
@@ -16,8 +16,8 @@ extern "C" {
 
 typedef struct bm_answerer bm_answerer;
 
-#define BM_RUNNING      0   /* V.8 or V.34 start-up still going */
-#define BM_CONNECTED    1   /* in V.34 data mode */
+#define BM_RUNNING      0   /* negotiation or start-up still going */
+#define BM_CONNECTED    1   /* in data mode */
 #define BM_FAILED       2   /* terminal failure; bm_failure says why */
 #define BM_AGREED_V22   3   /* V.8 chose V.22bis: caller takes over */
 #define BM_AGREED_OTHER 4   /* no V.8 on the line: caller takes over */
@@ -29,8 +29,9 @@ typedef int (*bm_get_bit_fn)(void *user);
 typedef void (*bm_put_bit_fn)(void *user, int bit);
 
 /* answer: nonzero for the answering side. want_v34: nonzero to offer V.34
-   in the V.8 menu and to fall back to V.34 directly when V.8 does not
-   settle. Returns NULL only on allocation failure. */
+   in the V.8 menu, alongside V.32bis and V.22bis. Legacy answering calls
+   select V.32 from the opening tone or hand back to V.22bis.
+   Returns NULL only on allocation failure. */
 bm_answerer *bm_create(int answer, int want_v34,
                        bm_get_bit_fn get_bit, void *get_ud,
                        bm_put_bit_fn put_bit, void *put_ud);
@@ -39,7 +40,7 @@ bm_answerer *bm_create(int answer, int want_v34,
    category, then V.90's start-up at the line's 8 kHz. answer should be
    nonzero (V.8 pairs the answering end digital). One object carries the
    fallback ladder: digital pairing -> V.90; V.34 agreed without it, or
-   V.8 lost or unsettled -> the same 16 kHz V.34 stage bm_create runs;
+   negotiated V.32bis -> the 16 kHz V.32 stage; legacy V.32 opening -> V.32;
    V.22bis -> BM_AGREED_V22 for the caller to take over. On the V.90 path
    it negotiates V.42 LAPM and V.42bis compression by default; a peer without
    LAPM falls back to transparent async data. V90_COMPRESSION=0 keeps LAPM
@@ -48,6 +49,12 @@ bm_answerer *bm_create(int answer, int want_v34,
 bm_answerer *bm_create_v90(int answer,
                            bm_get_bit_fn get_bit, void *get_ud,
                            bm_put_bit_fn put_bit, void *put_ud);
+
+/* Dedicated V.32 (max_rate=9600) or V.32bis (max_rate=14400), with V.25
+   answering tone, V.42 detection and negotiated V.42bis compression. */
+bm_answerer *bm_create_v32(int answer, int max_rate,
+                         bm_get_bit_fn get_bit, void *get_ud,
+                         bm_put_bit_fn put_bit, void *put_ud);
 
 /* One 8 kHz line sample in, the corresponding outgoing sample out (s16).
    Deterministic: exactly one out per in, after a few milliseconds of

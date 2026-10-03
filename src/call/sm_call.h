@@ -49,6 +49,7 @@ typedef struct {
     int enable_ppp;
     int echo_data;                  /* loop data back instead of using pppd */
     int use_v8;                     /* run V.8 negotiation first */
+    int v32_max_rate;               /* dedicated V.32: 9600; V.32bis: 14400 */
     int use_v34;                    /* offer V.34 in V.8 (opt-in; the V.34
                                        receive data path is not finished yet) */
     int use_binmodem;               /* answer with the vendored BinModem

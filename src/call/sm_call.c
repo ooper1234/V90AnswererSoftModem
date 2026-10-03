@@ -225,7 +225,10 @@ void sm_call_init(sm_call_t *c, const sm_call_config_t *cfg, int call_id)
            entirely -- until the engine hands a V.22bis call back, which
            bm_poll does. The V.22bis engine is still initialised here: the
            hand-back runs it. */
-        c->bm = cfg->use_v90
+        c->bm = cfg->v32_max_rate
+                    ? bm_create_v32(1, cfg->v32_max_rate,
+                                    call_get_bit, c, call_put_bit, c)
+                    : cfg->use_v90
                     ? bm_create_v90(1 /* answer */,
                                     call_get_bit, c, call_put_bit, c)
                     : bm_create(1 /* answer */, cfg->use_v34,
@@ -233,7 +236,9 @@ void sm_call_init(sm_call_t *c, const sm_call_config_t *cfg, int call_id)
         if (c->bm)
         {
             c->phase = SM_CALL_V8;
-            sm_log_message(&c->log, SM_LOG_FLOW, cfg->use_v90
+            sm_log_message(&c->log, SM_LOG_FLOW, cfg->v32_max_rate
+                           ? "BinModem V.32/V.32bis answerer started (V.42/V.42bis)"
+                           : cfg->use_v90
                            ? "BinModem answerer started (V.90 + V.34 fallback, 8 kHz line path)"
                            : "BinModem answerer started (V.8 + V.34, 16 kHz engine)");
             v22bis_init(&c->modem, false /* answerer */, cfg->rate,
@@ -599,7 +604,9 @@ static void bm_poll(sm_call_t *c, int n)
                            ? "V.8 negotiated V.22bis; starting V.22bis"
                            : "V.8 not negotiated; starting V.22bis");
         c->mode = SM_CALL_MODE_V22;
-        v22bis_rx_restart(&c->modem);
+        /* Restart both directions: the fallback must begin with the 75 ms
+           gap and high-channel unscrambled ones, not stale TX training. */
+        v22bis_restart(&c->modem);
 #ifdef SM_HAVE_V8
         c->rx_guard = SM_SAMPLE_RATE * 500 / 1000;
 #endif

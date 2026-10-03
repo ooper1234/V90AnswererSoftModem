@@ -271,9 +271,17 @@ impl Analogue {
             let out = m.step(line);
             self.notes.extend(m.take_notes());
             if m.take_retrain() {
-                // 9.5.2: tone A and phase 2, whichever end began it; the
-                // capabilities are not exchanged again.
+                // Initial retrains, including requests from the digital
+                // peer, must count toward the analogue fallback decision.
+                // Established calls keep their separate retrain behaviour.
+                if !self.connected_once {
+                    self.failed_starts += 1;
+                }
                 self.back_to_phase2();
+                if !self.connected_once && self.failed_starts > V90_RETRAINS {
+                    self.notes.push("V.34 selected after unsuccessful V.90 retrains".into());
+                    self.v34.decline_pcm();
+                }
                 return out;
             }
             match m.status() {
@@ -324,6 +332,7 @@ impl Analogue {
 #[derive(Debug, Clone)]
 pub struct Digital {
     law: Law,
+    terminal_failure: Option<&'static str>,
     v34: v34::Modem,
     v90: Option<digital::Modem>,
     /// Phase 2 goes out through the codec like anything else, at the power
@@ -392,7 +401,8 @@ impl Digital {
         let phase2_gain = 10f64.powf((info0d.nominal_dbm0() - 3.17) / 20.0);
         Self {
             law,
-            v34: v34::Modem::with_phase2(phase2::Modem::v90(Pcm::Digital(info0d), digital::FS), digital::FS),
+            terminal_failure: None,
+            v34: v34::Modem::with_phase2(phase2::Modem::v90(Pcm::Digital(info0d), digital::FS), digital::FS).with_training_rate(16_000.0),
             v90: None,
             phase2_gain,
             failed_starts: 0,
@@ -491,6 +501,9 @@ impl Digital {
     }
 
     pub fn status(&self) -> Status {
+        if let Some(why) = self.terminal_failure {
+            return Status::Failed(why);
+        }
         match self.v90.as_ref().map(digital::Modem::status) {
             Some(digital::Status::Connected { downstream, upstream }) => {
                 Status::Connected { transmit: downstream, receive: upstream }
@@ -573,6 +586,9 @@ impl Digital {
 
     /// One network sample in, one out.
     pub fn step(&mut self, input: f64) -> f64 {
+        if self.terminal_failure.is_some() {
+            return 0.0;
+        }
         if let Some(m) = self.v90.as_mut() {
             let out = m.step(input);
             self.notes.extend(m.take_trace());
@@ -586,19 +602,25 @@ impl Digital {
                 _ => None,
             };
             let retrain = m.take_retrain();
-            if let Some(why) = failed {
-                // 9.5.1.1: tone B and phase 2, capabilities not exchanged
-                // again. One that will not train this many times in a row
-                // gets V.34's INFO1a in the next phase 2 (9.2.2.1.9 is the
-                // analogue modem's own side of that: the digital modem gets
-                // there by answering what it sends), so the call goes on as
-                // V.34 instead of dying on a far end that keeps asking for
-                // V.90.
+            // A deadline or a peer's tone A restarts an unsuccessful initial
+            // handshake too. Count it toward fallback, rather than repeatedly
+            // advertising PCM forever. Retrains of an established call remain
+            // separate from failed initial starts.
+            let unsuccessful_start = failed.or_else(|| {
+                (retrain && !self.connected_once).then(|| m.retrain_why()).flatten()
+            });
+            if let Some(why) = unsuccessful_start {
+                // The analogue modem selects V.90 or V.34 in INFO1a.
+                // decline_pcm only changes the analogue side's choice; it
+                // cannot force that choice from this digital server. Bound
+                // failed starts without pretending a V.34 fallback happened.
                 self.last_failure = Some(why);
                 self.failed_starts += 1;
                 if self.failed_starts > V90_RETRAINS {
-                    self.notes.push("V.34 next time round, not V.90".into());
-                    self.v34.decline_pcm();
+                    // The analogue modem can reach its own retry limit on
+                    // this same failure. Its V.34 selection arrives in the
+                    // next INFO1a; ending the call here prevents that fallback.
+                    self.notes.push("V.90 retry limit reached; waiting for the peer's V.34 selection in phase 2".into());
                 }
             } else if retrain {
                 // A retrain the start-up asked for itself: the analogue
@@ -631,6 +653,11 @@ impl Digital {
             && self.v34.training().is_none()
             && let (Some(asked), Some(info1d)) = (p2.info1a_pcm(), p2.info1c())
         {
+            if !self.connected_once && self.failed_starts > V90_RETRAINS {
+                self.terminal_failure = Some("V.90 startup retry limit reached; peer did not select V.34");
+                self.notes.push("V.90 retry limit reached; peer selected V.90 again instead of V.34".into());
+                return out * self.phase2_gain;
+            }
             let wide = p2.far_capabilities().is_some_and(|f| f.constellation_1664);
             let mut settings = digital::Settings::new(self.law, &info1d, &asked, p2.round_trip().unwrap_or(0.0), wide);
             settings.habits = self.habits;
@@ -639,5 +666,134 @@ impl Digital {
         // Everything that is not V.90's codewords goes out at that power:
         // phase 2, and V.34 if that is what the call became.
         out * self.phase2_gain
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use crate::v34::info::{Info1aPcm, Info1c, SymbolRate};
+
+    fn training() -> digital::Modem {
+        let asked = Info1aPcm {
+            md_length: 0, uinfo: 79, upstream: SymbolRate::S3200,
+            frequency_offset: None,
+        };
+        digital::Modem::new(digital::Settings::new(
+            Law::Mu, &Info1c::default(), &asked, 0.02, true,
+        ))
+    }
+
+    #[test]
+    fn repeated_initial_retrains_leave_phase2_open_for_the_v34_choice() {
+        let mut end = Digital::new(crate::v90::server::ours());
+        for attempt in 1..=V90_RETRAINS + 1 {
+            end.v90 = Some(training());
+            // No analogue S arrives: exercise the real startup deadline,
+            // whose retrain previously bypassed the failed-start counter.
+            for _ in 0..(20.0 * digital::FS) as usize {
+                end.step(0.0);
+                if end.v90.is_none() { break; }
+            }
+            assert_eq!(end.failed_starts, attempt);
+            assert!(end.v90.is_none());
+            assert!(!matches!(end.status(), Status::Failed(_)), "ended before the peer could send INFO1a");
+            assert!(!end.notes.iter().any(|s| s.contains("V.34 next time")));
+        }
+    }
+
+    fn final_selection(decline_pcm: bool) -> (Digital, Analogue, Vec<bool>, Vec<bool>) {
+        use crate::v90::network::Network;
+        let fs = 16_000.0;
+        let mut end = Digital::new(crate::v90::server::ours());
+        if !decline_pcm { end.failed_starts = V90_RETRAINS + 1; }
+        let mut peer = Analogue::new(fs);
+        let mut initial_retrains = 0;
+        let mut net = Network::new(Law::Mu, fs).with_delay(0.020, fs).with_noise(1e-5);
+        let mut up = Vec::new();
+        let mut armed = false;
+        let down_bits: Vec<bool> = (0..256).map(|i| (i * 17 + i / 3) % 7 < 3).collect();
+        let up_bits: Vec<bool> = (0..256).map(|i| (i * 13 + i / 5) % 11 < 5).collect();
+        let mut received_down = Vec::new();
+        let mut received_up = Vec::new();
+        for _ in 0..(45.0 * digital::FS) as usize {
+            let input = net.up(&up);
+            up.clear();
+            let out = end.step(input);
+            for x in net.down(out) { up.push(peer.step(x)); }
+            if decline_pcm && initial_retrains < V90_RETRAINS + 1
+                && end.v90.is_some() && peer.v90.is_some() {
+                // Both ends really exchanged phase 2. Ask for an initial
+                // retrain before V.90 connects, retaining negotiated state.
+                end.v90.as_mut().unwrap().start_retrain();
+                peer.v90.as_mut().unwrap().start_retrain();
+                initial_retrains += 1;
+            }
+            if matches!(end.status(), Status::Failed(_)) { break; }
+            let at_end = end.take_bits();
+            let at_peer = peer.take_bits();
+            if armed {
+                received_up.extend(at_end);
+                received_down.extend(at_peer);
+                if received_up.windows(up_bits.len()).any(|w| w == up_bits)
+                    && received_down.windows(down_bits.len()).any(|w| w == down_bits) { break; }
+            } else if matches!(end.status(), Status::Connected { .. })
+                && matches!(peer.status(), Status::Connected { .. }) {
+                armed = true;
+                end.send_bits(&down_bits);
+                peer.send_bits(&up_bits);
+            }
+        }
+        (end, peer, received_down, received_up)
+    }
+
+
+    #[test]
+    fn final_phase2_v34_selection_connects_and_carries_both_directions() {
+        let (end, peer, down, up) = final_selection(true);
+        assert!(matches!(end.status(), Status::Connected { .. }), "{:?}", end.status());
+        assert!(matches!(peer.status(), Status::Connected { .. }), "{:?}", peer.status());
+        assert!(!end.is_v90() && !peer.is_v90());
+        let expected_down: Vec<bool> = (0..256).map(|i| (i * 17 + i / 3) % 7 < 3).collect();
+        let expected_up: Vec<bool> = (0..256).map(|i| (i * 13 + i / 5) % 11 < 5).collect();
+        assert!(down.windows(expected_down.len()).any(|w| w == expected_down));
+        assert!(up.windows(expected_up.len()).any(|w| w == expected_up));
+    }
+
+    #[test]
+    fn final_phase2_pcm_selection_still_bounds_failed_v90_starts() {
+        let (end, _, _, _) = final_selection(false);
+        assert_eq!(end.status(), Status::Failed("V.90 startup retry limit reached; peer did not select V.34"));
+        assert!(end.v90.is_none(), "started another V.90 handshake after the retry limit");
+        assert!(end.v34.phase2().info1a_pcm().is_some(), "failed before receiving the peer's selection");
+    }
+
+    #[test]
+    fn established_call_retrain_does_not_consume_startup_budget() {
+        let mut end = Digital::new(crate::v90::server::ours());
+        end.connected_once = true;
+        let mut modem = training();
+        modem.start_retrain();
+        end.v90 = Some(modem);
+        end.step(0.0);
+        assert_eq!(end.failed_starts, 0);
+        assert!(end.v90.is_none());
+    }
+
+    #[test]
+    fn established_analogue_retrain_does_not_select_fallback() {
+        let mut peer = Analogue::new(16_000.0);
+        peer.connected_once = true;
+        let asked = Info1aPcm { md_length: 0, uinfo: 79,
+            upstream: SymbolRate::S3200, frequency_offset: None };
+        let mut modem = analogue::Modem::new(analogue::Settings::new(
+            &crate::v90::server::ours(), &Info1c::default(), &asked, 0.02, true,
+        ), 16_000.0);
+        modem.start_retrain();
+        peer.v90 = Some(modem);
+        peer.step(0.0);
+        assert_eq!(peer.failed_starts, 0);
+        assert!(peer.v90.is_none());
+        assert!(!peer.notes.iter().any(|n| n.contains("V.34 selected")));
     }
 }

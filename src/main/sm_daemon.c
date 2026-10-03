@@ -41,16 +41,19 @@ static void usage(void)
             "  --bbs-db PATH        persistent BBS SQLite database (default bbs.db)\n"
             "  --echo               echo received data back (byte-exact test mode)\n"
             "  --v8                 negotiate with V.8 first (else plain answer tone)\n"
-            "  --v34                offer V.34 in the V.8 menu (opt-in; the V.34\n"
-            "                       receive data path is not finished yet, so a\n"
-            "                       V.34 call will train but not carry usable data)\n"
+            "  --v34                offer V.34 in the V.8 menu (opt-in). Use\n"
+            "                       --binmodem or --v90 for the V.34 data engine.\n"
+            "  --v32                dedicated V.32 answerer, up to 9600 bit/s\n"
+            "  --v32bis             dedicated V.32bis answerer, up to 14400 bit/s\n"
+            "                       Both support V.42/V.42bis. V.8 modes also\n"
+            "                       select V.32bis when negotiated by a caller.\n"
             "  --binmodem           answer with the vendored BinModem engine: its\n"
             "                       own V.8 and V.34 start-up, 16 kHz internally.\n"
             "                       Needs --v34 to offer V.34.\n"
             "  --v90                BinModem V.90 mode (implies --binmodem): V.8\n"
             "                       offering the digital PCM category, V.90 when\n"
             "                       the far end pairs as the analogue half, V.34\n"
-            "                       fallback when it does not.\n"
+            "                       fallback when negotiated by the caller.\n"
             "  --debug              verbose logging\n"
             "  --shim FD            internal pppd relay (do not use)\n",
             prog, DEFAULT_PORT);
@@ -155,6 +158,11 @@ int main(int argc, char **argv)
             cfg.use_v34 = 1;
         else if (strcmp(argv[i], "--binmodem") == 0)
             cfg.use_binmodem = 1;
+        else if (strcmp(argv[i], "--v32") == 0 || strcmp(argv[i], "--v32bis") == 0)
+        {
+            cfg.v32_max_rate = strcmp(argv[i], "--v32") == 0 ? 9600 : 14400;
+            cfg.use_binmodem = 1;
+        }
         else if (strcmp(argv[i], "--v90") == 0)
         {
             cfg.use_v90 = 1;
@@ -195,7 +203,10 @@ int main(int argc, char **argv)
     signal(SIGCHLD, SIG_IGN);
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_term;
-    sa.sa_flags = SA_RESTART;
+    /* Wake the idle accept so the loop can observe g_run on termination.
+       Restarting accept leaves a stopped daemon holding its port until the
+       next caller arrives, preventing its replacement from starting. */
+    sa.sa_flags = 0;
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
 

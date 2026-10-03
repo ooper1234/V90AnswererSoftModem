@@ -975,6 +975,8 @@ pub struct Startup {
     pending_sequence: Option<u16>,
     /// What this modem offers, and what has been settled on.
     offer: u16,
+    /// Rate-signal format supported by the far end in this exchange.
+    peer_bis: bool,
     /// Which of 9600's two modulations the rate exchange settled on.
     coding: Coding,
     agreed: u32,
@@ -1035,6 +1037,7 @@ impl Startup {
             pending_sideband_reversal: false,
             pending_sequence: None,
             offer,
+            peer_bis: is_v32bis(offer),
             coding: Coding::Uncoded,
             agreed: 0,
             cued: None,
@@ -1618,6 +1621,7 @@ impl Startup {
                     rx.hunt();
                 }
                 if let Some(s) = sequence.filter(|&s| is_rate_signal(s)) {
+                    self.peer_bis = is_v32bis(s);
                     self.agreed = usable_rate(s, self.offer)
                         .min(offered_rate(self.offer));
                     self.coding = agreed_coding(s, self.offer, self.agreed);
@@ -1778,6 +1782,7 @@ impl Startup {
             State::AwaitingR2 => {
                 tx.set_signal(Signal::Silent);
                 if let Some(s) = sequence.filter(|&s| is_rate_signal(s)) {
+                    self.peer_bis = is_v32bis(s);
                     self.agreed = usable_rate(s, self.offer)
                         .min(offered_rate(self.offer));
                     self.coding = agreed_coding(s, self.offer, self.agreed);
@@ -1808,7 +1813,15 @@ impl Startup {
                 if self.symbols >= self.training_symbols() {
                     self.trained = true;
                     self.rates.reset();
-                    tx.set_signal(Signal::Rate(self.offer));
+                    // R2 must exclude rates absent from R1; R3 selects one
+                    // rate within R2 (V.32bis 6.1/6.2). Repeating our original
+                    // offer here advertises rates the peer already excluded.
+                    let signal = if self.agreed == 0 {
+                        self.offer // Answering modem's initial R1.
+                    } else {
+                        rate_signal_for(self.agreed, self.coding, self.peer_bis)
+                    };
+                    tx.set_signal(Signal::Rate(signal));
                     self.enter(State::SendRate);
                 }
             }
@@ -2347,7 +2360,10 @@ impl Modem {
         // chance to find out where the line puts it back as well as what shape
         // it comes back in. The first half goes on finding it and the second
         // on cancelling it.
-        if self.startup.training_echo() && !self.was_training {
+        if self.startup.training_echo() && !self.was_training && self.reflection.is_none() {
+            // On a retrain, keep the far taps already tracking the hybrid.
+            // Searching the residual beyond their span finds the echo's weak
+            // tail and replacing the working filter with it loses cancellation.
             self.begin_search();
         }
         let cleaned = self.echo.process(sent, line);
@@ -2456,7 +2472,12 @@ impl Modem {
     /// down, which is the error the subtraction models least well.
     fn begin_search(&mut self) {
         let first = self.echo.span();
-        let last = self.round_trip_samples() + self.far_taps();
+        // Packet buffering and detector/turnaround timing can make the tone
+        // exchange underestimate the delayed hybrid echo. A real ATA gave
+        // 143 ms here while its echo arrived at 164 ms; the original bound
+        // excluded it entirely. Allow three 20 ms packets plus some slack.
+        let packet_slack = (0.064 * self.fs) as usize;
+        let last = self.round_trip_samples() + self.far_taps() + packet_slack;
         if last <= first {
             return;
         }
@@ -2523,6 +2544,16 @@ impl Modem {
     /// Ask for a retrain (7).
     pub fn ask_for_retrain(&mut self) {
         self.startup.ask_for_retrain();
+    }
+
+    /// V.8 has already supplied the answering tone; begin the V.32 opening.
+    pub fn after_answer_tone(&mut self) {
+        if self.startup.role == Role::Answering
+            && self.startup.state == State::AnswerTone
+        {
+            self.tx.set_signal(Signal::AlternateAC);
+            self.startup.enter(State::Ac);
+        }
     }
 
     /// How many times this call has gone back through the start-up.
@@ -2663,6 +2694,42 @@ impl Modem {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn echo_search_includes_packet_delay_beyond_tone_round_trip() {
+        let mut modem = Modem::new(Role::Answering,
+            rate_signal(Rates::between(4800, 14400)), 16000.0);
+        modem.startup.state = State::SendTrn;
+        modem.startup.round_trip = 344; // 143 ms estimated by the tone exchange.
+        modem.tx.set_signal(Signal::Trn);
+        let delay = 2624; // The ATA's actual 164 ms echo.
+        let mut echo = std::collections::VecDeque::from(vec![0.0; delay]);
+        for _ in 0..40000 {
+            let sent = modem.step(echo.pop_front().unwrap());
+            echo.push_back(sent * 0.22);
+        }
+        let reflection = modem.reflection().expect("delayed ATA echo was excluded");
+        assert!(reflection.delay.abs_diff(delay) < 64);
+        assert!(modem.echo_return_loss() > 15.0);
+    }
+    #[test]
+    fn training_rate_signal_respects_the_peer_selection() {
+        for role in [Role::Calling, Role::Answering] {
+            for bis in [false, true] {
+                let offer = rate_signal(Rates::between(4800, 14400));
+                let mut startup = Startup::new(role, offer, 16000.0);
+                let (mut tx, mut rx) = endpoints(role, 16000.0);
+                startup.agreed = 9600;
+                startup.coding = Coding::Trellis;
+                startup.peer_bis = bis;
+                startup.state = State::SendTrn;
+                startup.symbols = startup.training_symbols();
+                startup.advance(false, false, None, &mut tx, &mut rx);
+                let Signal::Rate(signal) = tx.signal() else { panic!("missing rate signal") };
+                assert_eq!(rates_offered(signal), Rates::only(9600));
+                assert_eq!(is_v32bis(signal), bis);
+            }
+        }
+    }
     use super::*;
 
     const FS: f64 = 16_000.0;

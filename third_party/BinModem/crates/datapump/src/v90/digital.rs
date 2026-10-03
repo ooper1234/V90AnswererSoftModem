@@ -869,6 +869,7 @@ pub struct Modem {
     /// whether one is wanted.
     retrain_watch: RetrainWatch,
     wants_retrain: bool,
+    data_lost_since: Option<u64>,
     /// What asked for the retrain, for the transcript: the tone, the
     /// deadline's own words, or the modem above.
     retrain_why: Option<&'static str>,
@@ -952,6 +953,7 @@ impl Modem {
             phase3_snr: None,
             retrain_watch: RetrainWatch::new(Role::Answer, FS),
             wants_retrain: false,
+            data_lost_since: None,
             retrain_why: None,
             trace: Vec::new(),
             far_peak: 0.0,
@@ -1357,6 +1359,17 @@ impl Modem {
                 if error < level { "open" } else { "shut" },
                 self.rx.band().carrier()
             ));
+        }
+        // A continuous loss of receive lock cannot deliver PPP data. Give
+        // brief disturbances time to settle, then use the existing full
+        // retrain path rather than leaving the call connected but unreadable.
+        if held_loss(&mut self.data_lost_since, self.now,
+            self.stage == Stage::Data && self.rx.is_lost())
+            && !self.wants_retrain
+        {
+            self.retrain_why = Some("receive lock lost continuously for five seconds");
+            self.say("receive lock lost continuously for five seconds: retrain");
+            self.wants_retrain = true;
         }
         match self.watching() {
             Some(learn) => {
@@ -1963,7 +1976,7 @@ impl Modem {
         // themselves rather than being told, so it is where a real modem and
         // this one can differ by a step and hand the receiver noise.
         if let Some(bps) = std::env::var("V90_UP_RATE").ok().and_then(|v| v.parse::<u32>().ok()) {
-            self.upstream_rate = bps;
+            self.upstream_rate = self.upstream_rate.min((bps / 2400).clamp(2, 14) * 2400);
         }
         // V90_UP_EXPANDED, like the two below, takes the shaping the MP asks
         // the far end's transmitter to use.
@@ -2037,11 +2050,13 @@ impl Modem {
     /// This end's MP: what the analogue modem's transmitter is to do.
     fn make_mp(&self) -> Mp {
         let rate = self.settings.upstream.rate;
-        let snr = 10f64.powf(self.phase3_snr.unwrap_or(20.0).min(60.0) / 10.0);
-        let bits = (1.0 + snr / 10f64.powf(0.6)).log2();
+
         let most = crate::v34::probe::ceiling(rate);
         let most = if self.settings.wide { most } else { most.min(12) };
-        let upstream = ((bits * self.settings.upstream.baud() / 2400.0).floor() as u8).clamp(2, most);
+        let margin = std::env::var("V90_UP_MARGIN_DB").ok()
+            .and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite())
+            .unwrap_or(0.0).clamp(0.0, 12.0);
+        let upstream = upstream_with_headroom(self.phase3_snr.unwrap_or(20.0), self.settings.upstream.baud(), most, margin);
         let mut upstream = self.upstream_cap.map_or(upstream, |cap| upstream.min(cap.max(2)));
         // V90_UP_RATE, in bit/s, takes the maximum analogue-to-digital rate
         // this end asks for, and with it the rate the receiver takes: the two
@@ -2049,7 +2064,7 @@ impl Modem {
         // MP and this end then has to read what the MP asked for. A bench hook
         // for the case where the far modem does not follow the MP.
         if let Some(bps) = std::env::var("V90_UP_RATE").ok().and_then(|v| v.parse::<u32>().ok()) {
-            upstream = (bps / 2400).clamp(2, 14) as u8;
+            upstream = upstream.min((bps / 2400).clamp(2, 14) as u8);
         }
         Mp {
             call_to_answer: 0,
@@ -2078,9 +2093,56 @@ pub fn upstream_rate(cp: &Cp, mp: &Mp) -> u8 {
     (2..=mp.answer_to_call.min(14)).rev().find(|r| enabled >> (r - 1) & 1 == 1).unwrap_or(0)
 }
 
+// Phase-3 training on the live ATA measured about 35–36 dB while data mode
+// settled near 30 dB. Reserve six dB for that difference when offering an
+// upstream rate; do not treat the training peak as sustainable data SNR.
+// This is a local margin policy, not a protocol-mandated rate limit.
+fn upstream_with_headroom(training_snr_db: f64, baud: f64, most: u8, margin_db: f64) -> u8 {
+    let data_snr = 10f64.powf((training_snr_db.min(60.0) - margin_db) / 10.0);
+    let bits = (1.0 + data_snr / 10f64.powf(0.6)).log2();
+    ((bits * baud / 2400.0).floor() as u8).clamp(2, most)
+}
+/// Local recovery policy, measured in line samples, not wall-clock time.
+fn held_loss(since: &mut Option<u64>, now: u64, lost: bool) -> bool {
+    if !lost {
+        *since = None;
+        return false;
+    }
+    let start = *since.get_or_insert(now);
+    now.saturating_sub(start) >= (5.0 * FS) as u64
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn training_snr_reserves_margin_for_the_data_path() {
+        // The real ATA's 35 dB training / 30 dB data must not offer 28,800.
+        assert_eq!(upstream_with_headroom(35.0, 3200.0, 14, 6.0), 10);
+        // A clean line can still offer full upstream rate.
+        assert_eq!(upstream_with_headroom(45.0, 3200.0, 14, 6.0), 14);
+        // Respect the negotiated symbol-rate ceiling too.
+        assert_eq!(upstream_with_headroom(45.0, 3200.0, 12, 6.0), 12);
+    }
+
+    #[test]
+    fn continuous_receive_loss_requires_five_seconds() {
+        let mut since = None;
+        assert!(!held_loss(&mut since, 100, true));
+        assert!(!held_loss(&mut since, 40099, true));
+        assert!(held_loss(&mut since, 40100, true));
+    }
+
+    #[test]
+    fn recovered_lock_does_not_accumulate_old_loss() {
+        let mut since = None;
+        assert!(!held_loss(&mut since, 0, true));
+        assert!(!held_loss(&mut since, 39999, true));
+        assert!(!held_loss(&mut since, 40000, false));
+        assert!(!held_loss(&mut since, 80000, true));
+        assert!(!held_loss(&mut since, 119999, true));
+        assert!(held_loss(&mut since, 120000, true));
+    }
     use crate::v90::encoder::Decoder;
     use crate::v90::modulus::Constellation;
     use crate::v90::sign::Redundancy;

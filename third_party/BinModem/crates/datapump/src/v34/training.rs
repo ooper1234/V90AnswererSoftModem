@@ -2042,6 +2042,20 @@ mod tests {
     }
 
     /// A pattern no idle line of ones could be mistaken for.
+    #[test]
+    fn data_crosses_with_400_and_500_ms_round_trips() {
+        let from_call = pattern(6000, 37);
+        let from_answer = pattern(6000, 13);
+        for one_way in [0.200, 0.250] {
+            let (caller, answerer, at_call, at_answer) =
+                call_with_data(one_way, 45.0, 60.0, 25.0, &from_call, &from_answer);
+            check_connected(&caller, &answerer);
+            assert!(contains(&at_answer, &from_call));
+            assert!(contains(&at_call, &from_answer));
+        }
+    }
+
+    /// A pattern no idle line of ones could be mistaken for.
     fn pattern(length: usize, step: usize) -> Vec<bool> {
         (0..length).map(|i| (i * step + 11) % 7 < 3).collect()
     }

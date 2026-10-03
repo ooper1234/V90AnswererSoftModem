@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 use std::os::raw::{c_char, c_double, c_int, c_void};
 
 use datapump::v34;
+use datapump::v32;
 use datapump::v8 as v8line;
 use datapump::v90;
 use datapump::framing::AsyncBits;
@@ -217,6 +218,7 @@ fn recorded_next() -> Option<f64> {
 const ECHO_RING: usize = 8192; /* transmit history, just over a second */
 const ECHO_LAG_LO: usize = 640; /* search from 80 ms ... */
 const ECHO_LAG_HI: usize = 3072; /* ... to 384 ms */
+const V34_ECHO_LAG_HI: usize = 6000; /* V.34 carrier routes: up to 750 ms */
 const ECHO_WINDOW: usize = 1024; /* lock/adapt gate on 128 ms of input */
 const ECHO_PEAK_MIN: f64 = 0.3; /* correlation needed to lock a delay */
 const ECHO_QUIET_DB: f64 = -30.0; /* input loudness the far end must be under */
@@ -408,6 +410,8 @@ fn double_talk() -> bool {
 struct Echo {
     tx: Vec<f64>,
     tx_pos: usize,
+    /// Protocol-specific bound; V.90 keeps its original search cost.
+    lag_hi: usize,
     /// Locked echo delay in samples; 0 until a peak passes the gate.
     delay: usize,
     /// The correlation the lock was accepted on.
@@ -461,6 +465,8 @@ struct Echo {
     identified: bool,
     /// The data-mode tracker. See `TRACK_RING`.
     track: Track,
+    track_job: Option<std::sync::mpsc::Receiver<TrackFit>>,
+    track_epoch: u64,
     /// The filter at each commit, newest last, for the data-mode log to write
     /// out: the filter is not the one that was in place when the window opened.
     track_writes: Vec<(u64, usize, Vec<f64>)>,
@@ -485,6 +491,15 @@ struct Track {
     taken: usize,
     /// The last figure each candidate reached on the held-back samples, so the
     /// log says what was rejected and not only what was accepted.
+    held_best: f64,
+    held_now: f64,
+}
+
+struct TrackFit {
+    epoch: u64,
+    delay: usize,
+    w: Vec<f64>,
+    accepted: bool,
     held_best: f64,
     held_now: f64,
 }
@@ -625,6 +640,7 @@ impl Echo {
         Self {
             tx: vec![0.0; ECHO_RING],
             tx_pos: 0,
+            lag_hi: ECHO_LAG_HI,
             delay: 0,
             peak: 0.0,
             w: vec![0.0; echo_taps()],
@@ -636,6 +652,8 @@ impl Echo {
             identified: false,
             last: Last::default(),
             track: Track::default(),
+            track_job: None,
+            track_epoch: 0,
             track_writes: Vec::new(),
             echo_energy: 0.0,
             residual_energy: 0.0,
@@ -711,7 +729,7 @@ impl Echo {
             let mut best = self.delay;
             let mut bestc = -1.0f64;
             let lo = self.delay.saturating_sub(ECHO_HOLD);
-            let hi = (self.delay + ECHO_HOLD).min(ECHO_LAG_HI - 1);
+            let hi = (self.delay + ECHO_HOLD).min(self.lag_hi - 1);
             let mut lag = lo;
             while lag <= hi {
                 let c = self.corr_at(lag).abs();
@@ -730,7 +748,7 @@ impl Echo {
         let mut best = 0usize;
         let mut bestc = -1.0f64;
         let mut lag = ECHO_LAG_LO;
-        while lag < ECHO_LAG_HI {
+        while lag < self.lag_hi {
             let c = self.corr_at(lag).abs();
             if c > bestc {
                 bestc = c;
@@ -740,7 +758,7 @@ impl Echo {
         }
         if best != 0 {
             let lo = best.saturating_sub(4);
-            let hi = (best + 5).min(ECHO_LAG_HI - 1);
+            let hi = (best + 5).min(self.lag_hi - 1);
             for l in lo..=hi {
                 let c = self.corr_at(l).abs();
                 if c > bestc {
@@ -799,6 +817,22 @@ impl Echo {
         ls.buf_x.push(x);
         ls.buf_r.push(r);
     }
+
+    fn restart_training(&mut self) {
+        // Each retrain needs a fresh DIL measurement, while the working
+        // echo path and transmit history must survive.
+        self.ls = None;
+        self.ab = None;
+        self.far_silent = false;
+        self.frozen = false;
+        self.data = false;
+        self.seen.clear();
+        self.echo_energy = 0.0;
+        self.residual_energy = 0.0;
+        self.gate_samples = 0;
+        self.set_tracking(false);
+    }
+
 
     /// The echo path over one window of the line and our own transmit.
     ///
@@ -957,6 +991,9 @@ impl Echo {
     /// so that the window is the window the receiver is being given, not a
     /// window reconstructed afterwards.
     fn track_feed(&mut self, x: f64, r: f64) {
+        if self.track.since % 80 == 0 {
+            self.track_poll();
+        }
         self.track.rx.push_back(x);
         self.track.reference.push_back(r);
         if self.track.rx.len() > TRACK_RING {
@@ -966,7 +1003,78 @@ impl Echo {
         self.track.since += 1;
         if self.track.since >= TRACK_PERIOD {
             self.track.since = 0;
-            self.track_step();
+            self.track_launch();
+        }
+    }
+
+    fn set_tracking(&mut self, active: bool) {
+        if self.tracking != active {
+            self.track_epoch = self.track_epoch.wrapping_add(1);
+            // A fit must contain one continuous data interval. Never combine
+            // pre-retrain data with training tones or a new data constellation.
+            self.track.rx.clear();
+            self.track.reference.clear();
+            self.track.since = 0;
+        }
+        self.tracking = active;
+    }
+
+    fn track_launch(&mut self) {
+        if self.track_job.is_some() || self.delay == 0 || self.track.rx.len() < TRACK_FIT + TRACK_HOLD {
+            return;
+        }
+        let epoch = self.track_epoch;
+        let delay = self.delay;
+        let w = self.w.clone();
+        let rx = self.track.rx.clone();
+        let reference = self.track.reference.clone();
+        let tries = self.track.tries;
+        let taken = self.track.taken;
+        let (send, receive) = std::sync::mpsc::channel();
+        // The factorisation must not hold up the 20 ms AudioSocket stream.
+        // One worker at a time bounds CPU and memory use. It owns a snapshot;
+        // only the audio thread can install the completed filter.
+        if std::thread::Builder::new().name("v90-echo-fit".into()).spawn(move || {
+            let mut candidate = Echo::new();
+            candidate.delay = delay;
+            candidate.w = w;
+            candidate.track.rx = rx;
+            candidate.track.reference = reference;
+            candidate.track.tries = tries;
+            candidate.track.taken = taken;
+            candidate.track_step();
+            let _ = send.send(TrackFit {
+                epoch, delay: candidate.delay, w: candidate.w,
+                accepted: candidate.track.taken > taken,
+                held_best: candidate.track.held_best,
+                held_now: candidate.track.held_now,
+            });
+        }).is_ok() {
+            self.track.tries += 1;
+            self.track_job = Some(receive);
+        }
+    }
+
+    fn track_poll(&mut self) {
+        let Some(job) = self.track_job.as_ref() else { return };
+        match job.try_recv() {
+            Ok(fit) => {
+                self.track_job = None;
+                if !self.tracking || fit.epoch != self.track_epoch {
+                    eprintln!("  echo: completed data fit discarded after a phase change");
+                    return;
+                }
+                self.track.held_best = fit.held_best;
+                self.track.held_now = fit.held_now;
+                if fit.accepted {
+                    self.delay = fit.delay;
+                    self.w = fit.w;
+                    self.track.taken += 1;
+                    self.track_writes.push((self.track.rx.len() as u64, self.delay, self.w.clone()));
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.track_job = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
     }
 
@@ -1030,6 +1138,8 @@ impl Echo {
         let mut d0 = d0;
         let mut moved = 0isize;
         if peak.abs_diff(taps / 2) >= TRACK_EDGE
+            && (ECHO_LAG_LO as isize..=ECHO_LAG_HI as isize)
+                .contains(&(self.delay as isize + peak as isize - (taps / 2) as isize))
             && let Some(alt) = Self::solve_path(ref_fit, fit, d0 + (peak as isize - (taps / 2) as isize), taps)
         {
             let shift = peak as isize - (taps / 2) as isize;
@@ -1052,22 +1162,12 @@ impl Echo {
             );
             return;
         }
-        // The FIR window follows the path. The fit is expressed in the frame
-        // whose tap `j` is the line's response at delay `lock - centre + j`, so
-        // a peak away from the middle means the lock is holding the window in
-        // the wrong place, and the window is a finite one: a path at its edge
-        // has half its arrival outside the filter.
-        let shift = peak as isize - (taps / 2) as isize;
-        let mut w = vec![0.0; taps];
-        for (j, v) in cand.iter().enumerate() {
-            let k = j as isize - shift;
-            if k >= 0 && (k as usize) < taps {
-                w[k as usize] = *v;
-            }
-        }
+        // Commit the same coefficient/delay pair that was judged. Recentring
+        // taps independently shifts the live prediction away from the fitted
+        // path, even when the held-out score said the candidate was excellent.
+        let w = cand;
         if moved != 0 {
-            self.delay = (d0 + (taps / 2) as isize).clamp(ECHO_LAG_LO as isize, ECHO_LAG_HI as isize)
-                as usize;
+            self.delay = (d0 + (taps / 2) as isize) as usize;
         }
         let norm: f64 = w.iter().map(|v| v * v).sum::<f64>().sqrt();
         self.w = w.clone();
@@ -1586,6 +1686,7 @@ type GetBitFn = Option<unsafe extern "C" fn(*mut c_void) -> c_int>;
 type PutBitFn = Option<unsafe extern "C" fn(*mut c_void, c_int)>;
 
 enum Stage {
+    V32(Box<v32::startup::Modem>),
     /// V.8 running: ANSam out, CM in, JM out, or the caller's half of that.
     V8(Box<v8line::Modem>),
     /// V.34 from INFO0 to data mode and through everything after it.
@@ -1658,9 +1759,33 @@ pub struct Answerer {
     physical_connected: bool,
     ec_samples: u32,
     ec_frames_logged: u32,
+    legacy_v32_listener: v32::startup::Listener,
+    legacy_v32_tone_samples: u32,
+    v32_logged_phase: String,
 }
 
 impl Answerer {
+    fn no_v8_negotiation(&mut self) {
+        // A silent legacy caller does not select V.34 by failing to send CM.
+        // Hand the answering end back to C's V.22bis startup (unscrambled
+        // binary ones in the high channel), after ANSam has finished. Keep
+        // the calling end's explicitly selected non-V.8 V.34 behaviour.
+        if self.role == v34::phase2::Role::Answer {
+            if self.legacy_v32_tone_samples >= 214 {
+                // A sustained 1800 Hz AA identifies a legacy V.32 caller.
+                self.start_v32(14400);
+            } else {
+                self.status = BM_AGREED_OTHER;
+                self.stage = Stage::Done;
+            }
+        } else if self.wants_v34() {
+            if self.want_v90 { self.fall_to_v34(); } else { self.start_v34(); }
+        } else {
+            self.status = BM_AGREED_OTHER;
+            self.stage = Stage::Done;
+        }
+    }
+
     fn new(
         answer: bool,
         want_v34: bool,
@@ -1682,7 +1807,7 @@ impl Answerer {
         };
         // What goes in V.8's menu: V.34 when the caller wants it, and V.22bis
         // beside it so a far end that cannot do better still connects.
-        let mut menu = Modulations::of(&[Modulation::V22bis]);
+        let mut menu = Modulations::of(&[Modulation::V22bis, Modulation::V32bis]);
         if want_v34 {
             menu.insert(Modulation::V34Duplex);
         }
@@ -1726,7 +1851,11 @@ impl Answerer {
             fail_buf: [0; 160],
             mid: Vec::new(),
             out: VecDeque::new(),
-            echo: Echo::new(),
+            echo: {
+                let mut echo = Echo::new();
+                if !want_v90 { echo.lag_hi = V34_ECHO_LAG_HI; }
+                echo
+            },
             capture: std::env::var_os("BM_CAPTURE").map(|d| Capture::new(std::path::Path::new(&d))),
         v90_origin: 0,
         v90_now: 0,
@@ -1745,6 +1874,9 @@ impl Answerer {
             physical_connected: false,
             ec_samples: 0,
             ec_frames_logged: 0,
+            legacy_v32_listener: v32::startup::Listener::new(LINE_FS),
+            legacy_v32_tone_samples: 0,
+            v32_logged_phase: String::new(),
         }
     }
 
@@ -1807,7 +1939,27 @@ fn start_error_control(&mut self) {
     }
 
     fn start_v34(&mut self) {
+        self.echo.lag_hi = V34_ECHO_LAG_HI;
         self.stage = Stage::V34(Box::new(v34::startup::Modem::new(self.role, ENGINE_FS)));
+        self.status = BM_RUNNING;
+    }
+
+    fn start_v32(&mut self, max_rate: u32) {
+        let role = if self.role == v34::phase2::Role::Answer {
+            v32::startup::Role::Answering
+        } else { v32::startup::Role::Calling };
+        let rates = if max_rate <= 9600 {
+            v32::startup::Rates { at_4800: true, at_9600: true, ..Default::default() }
+        } else { v32::startup::Rates::between(4800, max_rate) };
+        let offer = if max_rate <= 9600 {
+            v32::startup::rate_signal_v32(rates, true)
+        } else { v32::startup::rate_signal(rates) };
+        self.want_v90 = false;
+        let mut modem = v32::startup::Modem::new(role, offer, ENGINE_FS);
+        if self.samples != 0 {
+            modem.after_answer_tone();
+        }
+        self.stage = Stage::V32(Box::new(modem));
         self.status = BM_RUNNING;
     }
 
@@ -1871,7 +2023,14 @@ fn start_error_control(&mut self) {
     /// modem's own PCM downstream comes back through that same path for the
     /// whole call, data mode included.
     fn linear_step(&mut self, input: c_int) -> c_int {
-        self.echo.frozen = false;
+        // This is a current phase, not a latched "once connected" flag.
+        // Retraining must not feed training tones into the data-mode fitter.
+        self.v90_in_data = matches!(&self.stage, Stage::V90(m)
+            if m.is_v90() && matches!(m.status(), v90::startup::Status::Connected { .. }));
+        // The digital wrapper can now be carrying V.34. Use V.34's stable
+        // data-mode echo filter once that fallback has connected.
+        self.echo.frozen = self.status == BM_CONNECTED
+            && matches!(&self.stage, Stage::V90(m) if !m.is_v90());
         // Data mode is where the echo path has to keep adapting with the far
         // end talking: both directions are wideband there, so the reflection
         // learned on the narrowband start-up sequences does not describe it.
@@ -1891,7 +2050,7 @@ fn start_error_control(&mut self) {
         // a change to make to a path that works. The two flags were the same
         // line for a while and every V.34 call was running the tracker, which
         // is the one thing not to do to it.
-        self.echo.tracking = self.v90_in_data;
+        self.echo.set_tracking(self.v90_in_data);
         let x = self.echo.sample(input as f64 / 32768.0);
         let y = match &mut self.stage {
             Stage::V8(m) => {
@@ -1909,6 +2068,10 @@ fn start_error_control(&mut self) {
                         self.lapm_declared = lapm;
                         self.start_v90();
                     }
+                    v8line::Status::Agreed(Modulation::V32bis) => {
+                        self.lapm_declared = lapm;
+                        self.start_v32(14400);
+                    }
                     v8line::Status::Agreed(Modulation::V22bis) => {
                         self.status = BM_AGREED_V22;
                         self.stage = Stage::Done;
@@ -1923,18 +2086,10 @@ fn start_error_control(&mut self) {
                         self.status = BM_AGREED_OTHER;
                         self.stage = Stage::Done;
                     }
-                    // 8.1.1: no V.8 on the line, or nothing in common --
-                    // the same answers `engine_step` gives, and for the
-                    // same reason (a PAP2T audio bridge often loses the
-                    // CM/JM exchange over a line both ends could carry):
-                    // V.34 directly, since this mode always asks for it.
+                    // No CM response to ANSam: the legacy answering sequence,
+                    // rather than an unnegotiated V.34 phase 2 tone.
                     v8line::Status::NoNegotiation => {
-                        if self.wants_v34() {
-                            self.fall_to_v34();
-                        } else {
-                            self.status = BM_AGREED_OTHER;
-                            self.stage = Stage::Done;
-                        }
+                        self.no_v8_negotiation();
                     }
                     v8line::Status::Failed => {
                         if self.wants_v34() {
@@ -1947,8 +2102,15 @@ fn start_error_control(&mut self) {
                 out
             }
             Stage::V90(m) => {
+                let retrains_before = m.retrains();
                 let out = m.step(x);
                 let at = self.samples as f64 / LINE_FS;
+                if m.retrains() != retrains_before {
+                    self.echo.restart_training();
+                    self.echo_state_done = false;
+                    self.v90_failure = None;
+                    eprintln!("[{at:8.3}s] BinModem V.90 retrain {}: fresh echo-training measurement, retained path", m.retrains());
+                }
                 for note in m.take_notes() {
                     eprintln!("[{at:8.3}s] BinModem V.90: {note}");
                 }
@@ -1972,17 +2134,19 @@ fn start_error_control(&mut self) {
                     v90::startup::Status::Connected { transmit, receive } => {
                         self.rate_tx = transmit as c_int;
                         self.rate_rx = receive as c_int;
+                        self.v90_in_data = m.is_v90();
                         if !self.physical_connected {
                             self.physical_connected = true;
-                            self.v90_in_data = true;
                             self.v90_now = m.samples();
-                            // Armed unconditionally: the path is estimated from
-                            // this call's own data mode once there are samples
-                            // enough, and gating the arming on a path supplied
-                            // from outside left the replay never running.
-                            m.abc_arm(abc_path().unwrap_or_default(), self.echo.delay, self.echo.w.len());
-                            self.abc_armed = true;
-                            if v90_error_control() {
+                            // Extra replay receivers are diagnostics, not part
+                            // of the live demodulator. Their fitting and dense
+                            // resync searches must be explicitly requested.
+                            if self.v90_in_data && (std::env::var_os("V90_ABC_POINTS").is_some()
+                                || std::env::var_os("V90_ABC_PATH").is_some()) {
+                                m.abc_arm(abc_path().unwrap_or_default(), self.echo.delay, self.echo.w.len());
+                                self.abc_armed = true;
+                            }
+                            if !self.v90_in_data || v90_error_control() {
                                 self.start_error_control();
                             }
                         }
@@ -2012,7 +2176,7 @@ fn start_error_control(&mut self) {
             // Never stepped: falling out of V.8 switches `bm_step` to the
             // resampled path from the next sample (the V34 arm runs there),
             // and Done is silence by definition.
-            Stage::V34(_) | Stage::Done => 0.0,
+            Stage::V32(_) | Stage::V34(_) | Stage::Done => 0.0,
         };
 
         // The filter the tracker has committed since the last sample, in the
@@ -2086,6 +2250,11 @@ fn start_error_control(&mut self) {
                     self.start_v34();
                     return out;
                 }
+                v8line::Status::Agreed(Modulation::V32bis) => {
+                    self.lapm_declared = m.lapm();
+                    self.start_v32(14400);
+                    return out;
+                }
                 v8line::Status::Agreed(Modulation::V22bis) => {
                     self.status = BM_AGREED_V22;
                     self.stage = Stage::Done;
@@ -2096,15 +2265,10 @@ fn start_error_control(&mut self) {
                     self.stage = Stage::Done;
                     return out;
                 }
-                // 8.1.1: no V.8 on the line. The modulation +MS named goes
-                // ahead on its own, which here is V.34 when it was asked for.
+                // A caller's selected modulation can proceed without V.8;
+                // an unanswered ANSam at the answering end cannot select it.
                 v8line::Status::NoNegotiation => {
-                    if self.wants_v34() {
-                        self.start_v34();
-                    } else {
-                        self.status = BM_AGREED_OTHER;
-                        self.stage = Stage::Done;
-                    }
+                    self.no_v8_negotiation();
                     return out;
                 }
                 // Nothing in common, or nothing heard. Same answer as no
@@ -2120,6 +2284,25 @@ fn start_error_control(&mut self) {
                     return out;
                 }
             }
+        }
+        if let Stage::V32(m) = &mut self.stage {
+            let out = m.step(x);
+            match m.status() {
+                v32::startup::Status::Connected(rate) => {
+                    self.rate_tx = rate as c_int;
+                    self.rate_rx = rate as c_int;
+                    if !self.physical_connected {
+                        self.physical_connected = true;
+                        self.start_error_control();
+                    }
+                    self.tick_error_control(ENGINE_FS as u32);
+                    self.update_connected_status();
+                }
+                v32::startup::Status::Negotiating => self.status = BM_RUNNING,
+                v32::startup::Status::Retraining => self.status = BM_RETRAINING,
+                v32::startup::Status::Failed => self.fail("V.32/V.32bis training failed"),
+            }
+            return out;
         }
         if let Stage::V34(m) = &mut self.stage {
             let out = m.step(x);
@@ -2166,6 +2349,7 @@ fn start_error_control(&mut self) {
     fn phase_from_stage(&mut self) {
         let src: &[u8] = match &self.stage {
             Stage::V8(m) => m.phase().as_bytes(),
+            Stage::V32(m) => m.phase().as_bytes(),
             Stage::V34(m) => m.phase().as_bytes(),
             Stage::V90(m) => m.phase().as_bytes(),
             Stage::Done => b"",
@@ -2177,8 +2361,13 @@ fn start_error_control(&mut self) {
 
     /// Copy the current phase phrase into the buffer the C side reads.
     fn copy_phase(&mut self) {
+        if self.status == BM_RETRAINING {
+            return self.phase_from_stage();
+        }
         let src: &[u8] = if self.physical_connected {
-            if self.want_v90 {
+            // The V.90 wrapper also carries negotiated V.34 fallback. The
+            // requested mode is not the modulation actually on the line.
+            if matches!(&self.stage, Stage::V90(m) if m.is_v90()) {
                 if !v90_error_control() {
                     return self.phase_from_stage();
                 }
@@ -2191,6 +2380,16 @@ fn start_error_control(&mut self) {
                     Some(ec) if ec.phase() == EcPhase::Transparent => b"V.90 data / transparent",
                     Some(_) => b"V.42 negotiating",
                     None => b"V.90 data",
+                }
+            } else if matches!(self.stage, Stage::V32(_)) {
+                match self.ec.as_ref() {
+                    Some(ec) if ec.is_connected() => match ec.compression_name() {
+                        Some("V.42bis") => b"V.32/V.32bis data / V.42 / V.42bis",
+                        _ => b"V.32/V.32bis data / V.42",
+                    },
+                    Some(ec) if ec.phase() == EcPhase::Transparent => b"V.32/V.32bis data / transparent",
+                    Some(_) => b"V.42 negotiating",
+                    None => b"V.32/V.32bis data",
                 }
             } else {
                 match self.ec.as_ref() {
@@ -2206,6 +2405,7 @@ fn start_error_control(&mut self) {
             }
         } else { match &self.stage {
             Stage::V8(m) => m.phase().as_bytes(),
+            Stage::V32(m) => m.phase().as_bytes(),
             Stage::V34(m) => m.phase().as_bytes(),
             Stage::V90(m) => m.phase().as_bytes(),
             Stage::Done => b"",
@@ -2287,6 +2487,17 @@ pub extern "C" fn bm_create_v90(
         put_bit,
         put_ud,
     )))
+}
+
+/// Dedicated V.32 (9600 ceiling) or V.32bis (14400 ceiling), with V.42 detection.
+#[unsafe(no_mangle)]
+pub extern "C" fn bm_create_v32(answer: c_int, max_rate: c_int,
+    get_bit: GetBitFn, get_ud: *mut c_void, put_bit: PutBitFn, put_ud: *mut c_void,
+) -> *mut Answerer {
+    if max_rate != 9600 && max_rate != 14400 { return std::ptr::null_mut(); }
+    let mut end = Answerer::new(answer != 0, false, false, get_bit, get_ud, put_bit, put_ud);
+    end.start_v32(max_rate as u32);
+    Box::into_raw(Box::new(end))
 }
 
 /// One 8 kHz line sample in, the corresponding line sample out.
@@ -2396,6 +2607,12 @@ impl Answerer {
     }
 
     fn step_inner(&mut self, input: c_int) -> c_int {
+        if matches!(self.stage, Stage::V8(_)) {
+            self.legacy_v32_listener.feed(input as f64 / 32768.0);
+            self.legacy_v32_tone_samples = if self.legacy_v32_listener.carrier_standing() {
+                self.legacy_v32_tone_samples.saturating_add(1)
+            } else { 0 };
+        }
         self.samples += 1;
         if self.want_v90 {
             return self.linear_step(input);
@@ -2403,7 +2620,9 @@ impl Answerer {
         /* Frozen in data mode: with no MP left to protect, the two ends' idle
            scramblers are the only thing a lock could mistake for echo. */
         self.echo.frozen = self.status == BM_CONNECTED;
-        let line = self.echo.sample(input as f64 / 32768.0);
+        let line = if matches!(self.stage, Stage::V32(_)) {
+            input as f64 / 32768.0 // V.32 owns its training echo canceller.
+        } else { self.echo.sample(input as f64 / 32768.0) };
         let x = line / BOUNDARY_GAIN;
         self.up.process(x, &mut self.mid);
         let engine_in = std::mem::take(&mut self.mid);
@@ -2554,12 +2773,29 @@ pub extern "C" fn bm_up_odd(a: *mut Answerer, last: *mut u8) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn bm_service(a: *mut Answerer) {
     let a = unsafe { &mut *a };
+    if let Stage::V32(modem) = &mut a.stage {
+        if a.v32_logged_phase != modem.phase() {
+            a.v32_logged_phase = modem.phase().to_owned();
+            eprintln!("BinModem V.32 phase={} round_trip={} echo_loss={:.1} reflection={:?}",
+                modem.phase(), modem.round_trip(), modem.echo_return_loss(), modem.reflection());
+        }
+        for signal in modem.take_sequences() {
+            eprintln!("BinModem V.32 rate RX {signal:04x} phase={}", modem.phase());
+        }
+    }
+    // Keep V.32 line buffering below LAPM response/detection timers.
+    // 8192 bits can delay a 4800-bit/s response by 1.7 seconds.
+    let tx_watermark = if matches!(a.stage, Stage::V32(_)) {
+        (a.rate_tx.max(4800) as usize / 20).clamp(256, 1024)
+    } else { TX_WATERMARK };
     let (accepts, mut pending) = match &a.stage {
+        Stage::V32(m) => (matches!(m.status(), v32::startup::Status::Connected(_)), m.pending_bits()),
         Stage::V34(m) => (m.accepts_bits(), m.pending_bits()),
         Stage::V90(m) => (m.accepts_bits(), m.pending_bits()),
         _ => (false, 0),
     };
     let rx_bits = match &mut a.stage {
+        Stage::V32(m) => Some(m.take_bits()),
         Stage::V34(m) => Some(m.take_bits()),
         Stage::V90(m) => Some(m.take_bits()),
         _ => None,
@@ -2607,7 +2843,7 @@ pub extern "C" fn bm_service(a: *mut Answerer) {
                octets here; LAPM owns the synchronous line below it. */
             if ec.is_connected() {
                 let mut bytes = Vec::new();
-                while pending < TX_WATERMARK {
+                while pending < tx_watermark {
                     let raw = match a.get_bit {
                         Some(f) => unsafe { f(a.get_ud) },
                         None => 1,
@@ -2634,12 +2870,13 @@ pub extern "C" fn bm_service(a: *mut Answerer) {
                    line carried idle ones forever while get_bit was never
                    called, and a far end with no V.42 got a call that could
                    receive but never send. */
-                while pending < TX_WATERMARK {
+                while pending < tx_watermark {
                     let raw = match a.get_bit {
                         Some(f) => unsafe { f(a.get_ud) },
                         None => 1,
                     };
                     match &mut a.stage {
+                        Stage::V32(m) => m.send_bits(&[raw & 1 != 0]),
                         Stage::V34(m) => m.send_bits(&[raw & 1 != 0]),
                         Stage::V90(m) => m.send_bits(&[raw & 1 != 0]),
                         _ => break,
@@ -2648,16 +2885,23 @@ pub extern "C" fn bm_service(a: *mut Answerer) {
                 }
             } else {
                 match &mut a.stage {
+                    Stage::V32(m) => {
+                        pending = m.pending_bits();
+                        while pending < tx_watermark {
+                            m.send_bits(&[ec.next_bit()]);
+                            pending += 1;
+                        }
+                    }
                     Stage::V34(m) => {
                         pending = m.pending_bits();
-                        while pending < TX_WATERMARK {
+                        while pending < tx_watermark {
                             m.send_bits(&[ec.next_bit()]);
                             pending += 1;
                         }
                     }
                     Stage::V90(m) => {
                         pending = m.pending_bits();
-                        while pending < TX_WATERMARK {
+                        while pending < tx_watermark {
                             m.send_bits(&[ec.next_bit()]);
                             pending += 1;
                         }
@@ -2666,13 +2910,14 @@ pub extern "C" fn bm_service(a: *mut Answerer) {
                 }
             }
         } else {
-            while pending < TX_WATERMARK {
+            while pending < tx_watermark {
                 let raw = match a.get_bit {
                     Some(f) => unsafe { f(a.get_ud) },
                     None => 1,
                 };
                 match &mut a.stage {
-                    Stage::V34(m) => m.send_bits(&[raw & 1 != 0]),
+                    Stage::V32(m) => m.send_bits(&[raw & 1 != 0]),
+                        Stage::V34(m) => m.send_bits(&[raw & 1 != 0]),
                     Stage::V90(m) => m.send_bits(&[raw & 1 != 0]),
                     _ => break,
                 }
@@ -2718,6 +2963,7 @@ pub extern "C" fn bm_slips(a: *mut Answerer) -> u32 {
 pub extern "C" fn bm_pending(a: *mut Answerer) -> c_int {
     let a = unsafe { &*a };
     match &a.stage {
+        Stage::V32(m) => m.pending_bits() as c_int,
         Stage::V34(m) => m.pending_bits() as c_int,
         Stage::V90(m) => m.pending_bits() as c_int,
         _ => -1,
@@ -2733,6 +2979,7 @@ pub extern "C" fn bm_flush_rx(a: *mut Answerer) {
     let a = unsafe { &mut *a };
     if a.ec.is_none() {
         match &mut a.stage {
+            Stage::V32(m) => { let _ = m.take_bits(); }
             Stage::V34(m) => { let _ = m.take_bits(); }
             Stage::V90(m) => { let _ = m.take_bits(); }
             _ => {}
@@ -2819,6 +3066,7 @@ pub extern "C" fn bm_rate_rx(a: *mut Answerer) -> c_int {
 pub extern "C" fn bm_carrier(a: *mut Answerer) -> c_int {
     let a = unsafe { &*a };
     match &a.stage {
+        Stage::V32(m) => m.carrier() as c_int,
         Stage::V34(m) => m.carrier() as c_int,
         Stage::V90(m) => m.carrier() as c_int,
         _ => 0,
@@ -3372,6 +3620,46 @@ mod ls_tests {
         identification_at(ECHO_LAG_HI - 64, 0.05, ECHO_LAG_HI - 64);
     }
 
+    #[test]
+    fn v34_echo_range_is_enabled_on_v90_fallback() {
+        let mut end = Answerer::new(true, true, true, None, std::ptr::null_mut(), None, std::ptr::null_mut());
+        assert_eq!(end.echo.lag_hi, ECHO_LAG_HI);
+        end.start_v34();
+        assert_eq!(end.echo.lag_hi, V34_ECHO_LAG_HI);
+        assert!(V34_ECHO_LAG_HI + ECHO_WINDOW + end.echo.w.len() < ECHO_RING);
+    }
+
+    #[test]
+    fn v34_boundary_cancels_400_and_500_ms_echoes() {
+        for delay in [3200usize, 4000] {
+            let mut end = Answerer::new(true, true, false, None, std::ptr::null_mut(), None, std::ptr::null_mut());
+            end.start_v34();
+            let echo = &mut end.echo;
+            let mut old_echo = Echo::new();
+            let (reference, _) = reference_with_spread(16000, 20.0);
+            let mut before = 0.0f64;
+            let mut after = 0.0f64;
+            for (n, &tx) in reference.iter().enumerate() {
+                // Keep the echo below the quiet-peer gate so the test measures
+                // the delay search, rather than whether adaptation is allowed.
+                let input = if n >= delay { 0.03 * reference[n - delay] } else { 0.0 };
+                let residual = echo.sample(input);
+                echo.push(tx);
+                old_echo.sample(input);
+                old_echo.push(tx);
+                if n > 12000 {
+                    before += input * input;
+                    after += residual * residual;
+                }
+            }
+            let depth = 10.0 * (before / after.max(1e-30)).log10();
+            assert!(old_echo.delay.abs_diff(delay) > 4, "old range unexpectedly found the delayed echo");
+            println!("{} ms echo: delay={}, cancellation={depth:.1} dB", delay / 8, echo.delay);
+            assert!(echo.delay.abs_diff(delay) <= 4, "{} ms echo was not found: delay={}, peak={}", delay / 8, echo.delay, echo.peak);
+            assert!(depth > 15.0, "{} ms echo cancellation only {depth:.1} dB", delay / 8);
+        }
+    }
+
     /// The tracker has to take a better filter and refuse a worse one, and it
     /// has to judge both on samples the fit did not see.
     ///
@@ -3423,9 +3711,12 @@ mod ls_tests {
             noise = noise.wrapping_mul(1_103_515_245).wrapping_add(12_345);
             *v += ((noise >> 16) as f64 / 32768.0 - 0.5) * 0.012;
         }
+        weak.set_tracking(true);
         for (i, &x) in line.iter().enumerate() {
             weak.track_feed(x, r[i]);
+            if (i + 1) % TRACK_PERIOD == 0 { wait_for_tracking(&mut weak); }
         }
+        wait_for_tracking(&mut weak);
         let taken = weak.track.taken;
         assert!(
             taken > 0,
@@ -3454,9 +3745,12 @@ mod ls_tests {
             good.w[taps / 2 + k] = *g;
         }
         let before = good.w.clone();
+        good.set_tracking(true);
         for (i, &x) in line.iter().enumerate() {
             good.track_feed(x, r[i]);
+            if (i + 1) % TRACK_PERIOD == 0 { wait_for_tracking(&mut good); }
         }
+        wait_for_tracking(&mut good);
         assert_eq!(
             good.track.taken, 0,
             "a filter that already was the path was replaced {} times",
@@ -3468,6 +3762,140 @@ mod ls_tests {
                 "tap {k} moved from {b:+.6} to {a:+.6} on a line it already fitted"
             );
         }
+    }
+
+    fn wait_for_tracking(echo: &mut Echo) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while echo.track_job.is_some() && std::time::Instant::now() < deadline {
+            echo.track_poll();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(echo.track_job.is_none(), "echo worker did not finish");
+    }
+
+    #[test]
+    fn committed_tracking_taps_preserve_the_fitted_path_delay() {
+        for offset in [-12isize, 140] {
+            let lock = 1319usize;
+            let path_delay = (lock as isize + offset) as usize;
+            let n = TRACK_FIT + TRACK_HOLD + TRACK_PERIOD;
+            let (reference, _) = reference_with_spread(n + path_delay, 2.0);
+            let mut echo = Echo::new();
+            echo.delay = lock;
+            echo.w.fill(0.0);
+            echo.set_tracking(true);
+            for i in 0..n {
+                let line = if i >= path_delay { 0.15 * reference[i - path_delay] } else { 0.0 };
+                echo.track_feed(line, reference[i]);
+            }
+            wait_for_tracking(&mut echo);
+            assert!(echo.track.taken > 0, "no fit accepted for offset {offset}");
+            let peak = echo.w.iter().enumerate()
+                .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs())).unwrap().0;
+            let committed_delay = echo.delay as isize - (echo.w.len() / 2) as isize + peak as isize;
+            assert_eq!(committed_delay, path_delay as isize,
+                       "accepted filter changed the physical path for offset {offset}");
+        }
+    }
+
+    #[test]
+    fn a_completed_old_data_fit_cannot_overwrite_a_retrained_filter() {
+        let mut echo = Echo::new();
+        echo.delay = 1319;
+        echo.set_tracking(true);
+        let old_epoch = echo.track_epoch;
+        let (send, receive) = std::sync::mpsc::channel();
+        echo.track_job = Some(receive);
+        echo.set_tracking(false);
+        echo.set_tracking(true);
+        echo.delay = 1491;
+        let current = echo.w.clone();
+        send.send(TrackFit { epoch: old_epoch, delay: 800, w: vec![9.0; current.len()],
+            accepted: true, held_best: 0.0, held_now: 1.0 }).unwrap();
+        echo.track_poll();
+        assert_eq!(echo.delay, 1491);
+        assert_eq!(echo.w, current);
+        assert_eq!(echo.track.taken, 0);
+        assert!(echo.track_job.is_none());
+    }
+
+    #[test]
+    fn retraining_stops_tracking_and_discards_the_old_data_window() {
+        let mut end = Answerer::new(true, true, true, None,
+            std::ptr::null_mut(), None, std::ptr::null_mut());
+        end.start_v90();
+        end.v90_in_data = true;
+        end.echo.set_tracking(true);
+        for _ in 0..100 { end.echo.track_feed(0.03, 0.1); }
+        assert_eq!(end.echo.track.rx.len(), 100);
+        // Phase 2 has no current V.90 data signal, despite the stale flag.
+        end.linear_step(0);
+        assert!(!end.v90_in_data);
+        assert!(!end.echo.tracking);
+        assert!(end.echo.track.rx.is_empty());
+        assert!(end.echo.track.reference.is_empty());
+        assert_eq!(end.echo.track.since, 0);
+    }
+
+    #[test]
+    fn retraining_reports_the_current_handshake_instead_of_fallback_data() {
+        let mut end = Answerer::new(true, true, true, None,
+            std::ptr::null_mut(), None, std::ptr::null_mut());
+        end.start_v90();
+        end.physical_connected = true;
+        end.status = BM_RETRAINING;
+        end.copy_phase();
+        let phase = unsafe { std::ffi::CStr::from_ptr(end.phase_buf.as_ptr().cast()) };
+        assert_eq!(phase.to_bytes(), b"V.90 phase 2");
+    }
+
+    #[test]
+    fn unanswered_ansam_hands_v90_answerer_to_legacy_training() {
+        let mut end = Answerer::new(true, true, true, None,
+            std::ptr::null_mut(), None, std::ptr::null_mut());
+        for _ in 0..(LINE_FS * 7.0) as usize {
+            end.linear_step(0);
+            if end.status != BM_RUNNING { break; }
+        }
+        assert_eq!(end.status, BM_AGREED_OTHER);
+        assert!(matches!(end.stage, Stage::Done));
+    }
+
+
+
+    #[test]
+    fn legacy_v32_opening_selects_v32_without_repeating_the_answer_tone() {
+        let mut end = Answerer::new(true, true, true, None,
+            std::ptr::null_mut(), None, std::ptr::null_mut());
+        for i in 0..4000 {
+            let input = (8000.0 * (2.0 * std::f64::consts::PI * 1800.0 * i as f64 / LINE_FS).cos()) as c_int;
+            end.step_inner(input);
+        }
+        assert!(end.legacy_v32_tone_samples >= 214);
+        end.no_v8_negotiation();
+        let Stage::V32(modem) = &end.stage else { panic!("legacy V.32 not selected") };
+        assert_eq!(modem.phase(), "AC");
+    }
+
+    #[test]
+    fn unanswered_ansam_hands_v34_answerer_to_legacy_training() {
+        let mut end = Answerer::new(true, true, false, None,
+            std::ptr::null_mut(), None, std::ptr::null_mut());
+        for _ in 0..(ENGINE_FS * 7.0) as usize {
+            end.engine_step(0.0);
+            if end.status != BM_RUNNING { break; }
+        }
+        assert_eq!(end.status, BM_AGREED_OTHER);
+        assert!(matches!(end.stage, Stage::Done));
+    }
+
+    #[test]
+    fn calling_modem_keeps_its_selected_non_v8_v34_mode() {
+        let mut end = Answerer::new(false, true, false, None,
+            std::ptr::null_mut(), None, std::ptr::null_mut());
+        end.no_v8_negotiation();
+        assert_eq!(end.status, BM_RUNNING);
+        assert!(matches!(end.stage, Stage::V34(_)));
     }
 
     /// The A/B has to prefer the right filter for the right reason, so this
