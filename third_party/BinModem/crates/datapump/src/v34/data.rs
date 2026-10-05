@@ -1013,6 +1013,20 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "bounded high-speed noise comparison"]
+    fn high_speed_trellis_noise_comparison() {
+        for code in [Code::States16, Code::States32, Code::States64] {
+            for snr in [29.0, 30.0, 31.0, 32.0] {
+                let p = params(SymbolRate::S3200, 28_800, code, false, false);
+                let (sent, got) = loopback(p, 300, snr);
+                let wrong = sent.iter().zip(&got).skip(23).filter(|(a,b)| a != b).count();
+                println!("{code:?} 28800 {snr} dB: {wrong} wrong / {} bits", got.len());
+                if snr == 32.0 { assert_eq!(wrong, 0); }
+            }
+        }
+    }
+
+    #[test]
     fn a_frames_bits_come_back_from_its_split() {
         for (rate, primary) in [(SymbolRate::S3429, 4800), (SymbolRate::S3429, 7200), (SymbolRate::S2400, 2400), (SymbolRate::S3429, 33_600), (SymbolRate::S3000, 4800)] {
             let f = Framing::new(rate, primary, false, false).unwrap();

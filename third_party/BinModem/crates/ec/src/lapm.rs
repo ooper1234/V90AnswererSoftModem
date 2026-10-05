@@ -309,6 +309,14 @@ impl Lapm {
         self.state == State::Connected
     }
 
+    /// Age of the oldest unacknowledged I frame, excluding peer flow control.
+    /// Retransmissions and duplicate acknowledgements do not mean progress.
+    pub fn stalled_transmit_ms(&self) -> Option<u32> {
+        (self.is_connected() && self.va != self.vs && !self.peer_busy)
+            .then_some(self.awaiting_ms).flatten()
+    }
+
+
     /// Frames to hand to the HDLC layer.
     pub fn poll_transmit(&mut self) -> Option<(Frame, Kind)> {
         self.pump();
@@ -831,6 +839,22 @@ fn in_window(low: u8, n: u8, high: u8) -> bool {
 mod tests {
     use super::*;
     use crate::frame::DLCI_DATA;
+
+    #[test]
+    fn stalled_transmit_tracks_progress_and_excludes_flow_control() {
+        let (mut a, mut b)=pair(); a.connect(); settle(&mut a,&mut b);
+        assert_eq!(a.stalled_transmit_ms(),None);
+        a.send_data(b"pending");assert!(matches!(a.poll_transmit(),Some((Frame::I{..},_))));
+        a.tick(500);assert_eq!(a.stalled_transmit_ms(),Some(500));
+        a.receive(Frame::Rr{nr:0,pf:false},Kind::Response);
+        a.tick(500);assert_eq!(a.stalled_transmit_ms(),Some(1000));
+        a.receive(Frame::Rnr{nr:0,pf:false},Kind::Response);
+        assert_eq!(a.stalled_transmit_ms(),None,"peer flow control must not retrain");
+        a.receive(Frame::Rr{nr:0,pf:false},Kind::Response);
+        assert_eq!(a.stalled_transmit_ms(),Some(1000));
+        a.receive(Frame::Rr{nr:1,pf:false},Kind::Response);
+        assert_eq!(a.stalled_transmit_ms(),None,"acknowledgement clears stall");
+    }
 
     fn pair() -> (Lapm, Lapm) {
         (

@@ -239,8 +239,11 @@ check the client's manual DNS setting and the server's internet access.
 
 ## Live audio processing
 
-V.90 data-mode echo fitting runs on one background worker, so it cannot
-block delivery of the next AudioSocket audio frame. Completed fits from an
+V.90 keeps its trained echo path during data mode by default. A batch fit
+against simultaneous caller data can remove part of the wanted signal;
+a real call lost receive lock immediately after such a filter replacement.
+Set `V90_ECHO_TRACKING=1` only for experimental data-mode refitting. When
+enabled, fitting runs on one background worker, and completed fits from an
 earlier data interval are discarded after a retrain. Extra A/B/C replay
 receivers are disabled unless `V90_ABC_POINTS` or `V90_ABC_PATH` explicitly
 requests those diagnostics.
@@ -338,3 +341,127 @@ upstream still showed stalls, so the live six-dB safety margin remains in
 place. The corrected receiver with that margin completed 30/30 pings and
 both website downloads in its final short validation call. This correction
 does not establish reliable 28,800 or 33,600 upstream on the tested ATA.
+
+A subsequent live investigation found sustained receive-lock loss immediately
+after a data-window echo-filter replacement. Batch data-mode refitting is now
+opt-in (`V90_ECHO_TRACKING=1`); normal training and retraining identification
+remain enabled. The new policy passed 26 FFI unit tests and the three V.90
+transfer/compression/fallback integrations. Its final conservative-rate call
+verified two incompressible 32-KiB uploads by SHA256, all 30 pings within
+1,500 ms, and both webpage downloads. Intermediate 26,400-rate calls were
+not consistently reliable, and one corrected-modem repeat lost PPP, so
+these results do not establish that higher-rate upload stalls are solved.
+
+V.90 upstream coding: V90_UP_TRELLIS=32 or 64 now selects the trellis advertised in MP as well as the receiver decoder. The default remains 16 states. Previously this setting changed only the decoder, so it could disagree with the calling modem. Higher-rate reliability still requires end-to-end upload validation.
+
+Retraining S detection now averages twenty symbols before requiring a sustained match. A saved real-modem recording showed the old short-window detector missing S on two retries; the corrected detector recognized both before their deadlines. Receiver, fallback, V.42 and compression checks passed offline. End-to-end retrain recovery still needs confirmation on the real line.
+
+Echo delay recovery now checks for discrete 10/20-ms playout changes during
+connected data mode. It shifts the previously trained path only when both
+halves of a 4096-sample window confirm a substantial residual improvement,
+correlation with the known echo prediction and approximately unchanged gain.
+It does not fit new coefficients to incoming data. In a saved failed COM36
+call, a measured -80-sample jump caused sustained receive-lock loss. Replay
+with this correction recovered about 32-dB SNR and avoided the local five-second
+lock-loss retrain. All 27 FFI unit tests and three transfer/compression/fallback
+integrations passed. Live PPP verification remains pending: the first new
+COM36 attempt failed before dialing with Windows error 680 (no dial tone).
+
+Follow-up real-modem validation after restoring the laptop's SIP/RTP forwarding
+and Wi-Fi relay completed two COM36 calls: 307 seconds with 100/100 pings and
+ten verified 32-KiB uploads, then 213 seconds with 80/80 pings and eight verified
+32-KiB uploads plus an HTTPS example.com download. Both negotiated 24,000-bit/s
+upstream and had no post-connect retrains. These are conservative-rate results,
+not verification of 28,800/33,600 upstream. A separate PPP sender fix now limits
+relay reads to complete-byte capacity in the transmit bit queue; long retrains
+can no longer discard a read's tail merely because that queue fills. A socket
+regression covers full and partial capacity plus ordered recovery. Receiver
+playout-delay recovery does not remove the need for V.42 retransmission.
+
+V.34 echo identification now uses the phase-3 PP/TRN interval while the peer
+waits for J. The digital wrapper passes this interval through when V.90 falls
+back to V.34, and a full retrain starts a fresh measurement. The measured path
+freezes when the physical carrier connects, before V.42 negotiation. During
+V.34 training, the comparison keeps that path unless the gradient filter is
+at least 0.5 dB better; a noise-level difference had discarded a better path
+on a failed real call. `V34_ECHO_IDENTIFY=0` disables this measurement for
+comparative testing. Data-mode coefficient refitting remains opt-in.
+
+Real WSL validation of the final build completed three direct V.34 calls and
+one automatic V.90 call that actually selected V.34 fallback. All four opened
+PPP, completed a verified random 16-KiB upload, downloaded example.com, and
+returned all 40 pings. The automatic fallback negotiated 26,400 bit/s upstream
+and 33,600 downstream. Initial V.90 training still failed in that call; these
+results verify fallback recovery and bounded transfers, not uninterrupted
+long-term stability or reliable full-rate V.90 upload. The tested Conexant
+caller remains configured with `AT+MS=V90,1` for automatic selection.
+
+Regression coverage includes the quiet-window boundary and V.34 echo-filter
+comparison margin, plus a V.90-to-V.34 fallback with a delayed reflection that
+verifies 4096 bytes in each direction through V.42/V.42bis.
+
+V.90 receive recovery also checks validated LAPM framing. A whole-symbol
+playout jump can leave the carrier locked while shifting the data-frame
+clock. After three damaged frames and two seconds without an intact frame,
+the backend searches for receive framing again without stopping downstream
+feeding or resetting LAPM and compression. A regression drops 1960 upstream
+samples during compressed duplex traffic: without this guard the transfer
+fails; with it all 65,536 bytes in each direction arrive intact. Normal
+transfers and repeated V.90/V.34 caller retrains also pass offline. This
+result does not establish long-call hardware stability.
+
+Caller-initiated V.90 rate changes now clamp incoming data on S and wait for
+the S-to-S-bar transition before sending Rd at a data-frame boundary. The
+previous early response violated the order specified by V.90 9.6.1.2.1-2.
+A compressed duplex regression verifies two caller rate changes without a
+full retrain and checks all 65,536 bytes in each direction. This correction
+has passed offline checks; sustained hardware verification is recorded
+separately rather than inferred from the simulation.
+
+Phase-three V.90 training now listens for caller S only after Jd begins and
+starts Jd within the 4000-ms deadline (3996 ms on a symbol boundary). The
+long training profile includes round-trip allowance. This avoids accepting
+premature tone indications during TRN1d, including repeated training.
+
+Receive recovery distinguishes intact LAPM data frames from short supervisory
+frames. Persistent data-frame CRC failures can request a full physical retrain;
+stalled unacknowledged downstream data can also trigger recovery. Requests are
+bounded, preserve LAPM/compression state, and clear stale recovery evidence
+with a five-second grace period when the physical link returns to data mode.
+Offline compressed duplex and repeated-retrain regressions pass. Hardware
+long-call reliability remains under investigation.
+
+Asterisk 20.6 AudioSocket deployments can additionally use the sample-clock
+patch documented in `scripts/asterisk/README.md`. It prevents wall-clock steps
+from introducing RTP timestamp holes. It does not by itself guarantee reliable
+modem operation over VoIP.
+
+The October 4 single-modem hardware check of these corrections reached V.90
+PPP on all three short calls, passed all three uploads and webpage downloads,
+and passed two of three bulk downloads. The sustained trial failed after
+7m15s with repeated final-training failures, V.34 fallback and PPP loss.
+These corrections are not a verified 30-minute stability fix.
+
+The final-training echo comparison now actually bypasses cancellation when
+both candidate filters are rejected. Previously, it logged that neither fit
+was acceptable but retained the temporarily installed block fit. A regression
+reproduces the harmful retained filter before the correction; good-fit and
+repeated-retrain tests also pass. Hardware results are recorded separately.
+
+Final-training echo timing can now follow independently validated 10/20-ms
+playout shifts after the silent training measurement has completed. Previously,
+timing recovery ran only after reaching data mode, so a shift during final
+training could bury the caller's CP messages in the answerer's own reflection.
+The recorded failed-first-attempt regression now recovers a valid 48,000-bit/s
+CP following a 10-ms shift. The correction preserves the trained coefficients
+and the existing correlation/gain/improvement checks. It is disabled during
+silent fitting, candidate comparison and coefficient tracking. Open-loop
+recording playback verifies CP decoding, not a responsive hardware handshake.
+
+The October 5 COM36/PAP2 Line 2 check of the final-training timing correction
+reached V.90 PPP on five of five short calls, all on their initial training.
+The sustained single-modem trial stayed in V.90 with PPP for 30m18s; all seven
+retrains returned to data mode. It returned 128/138 pings, passed 42/46 verified
+uploads and 41/46 webpage and bulk downloads. Intermittent stalls remain;
+connection survival is verified for this trial, but uninterrupted data transfer
+and multilink reliability are not established by it.

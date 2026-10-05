@@ -392,7 +392,11 @@ impl Digital {
     /// so the one window in the call where the path can be learned is the one
     /// a level test would shut.
     pub fn far_end_silent(&self) -> bool {
-        self.v90.as_ref().is_some_and(|m| m.far_end_silent())
+        if let Some(m) = self.v90.as_ref() {
+            m.far_end_silent()
+        } else {
+            self.v34.far_end_silent()
+        }
     }
 
     pub fn new(info0d: Info0d) -> Self {
@@ -556,6 +560,10 @@ impl Digital {
         }
     }
 
+    pub fn recover_upstream_framing(&mut self) -> bool {
+        self.v90.as_mut().is_some_and(|m| m.recover_upstream_framing())
+    }
+
     /// Start a full retrain (9.5.1.1).
     pub fn retrain(&mut self) -> bool {
         match self.v90.as_mut() {
@@ -642,6 +650,11 @@ impl Digital {
         }
         let p2 = self.v34.phase2();
         if !phase2_was_done && p2.status() == phase2::Status::Done {
+            if p2.info1a().is_some() && p2.info1a_pcm().is_none() {
+                // The fresh INFO1a selected V.34. An earlier V.90 timeout
+                // does not describe this training engine or its later retries.
+                self.last_failure = None;
+            }
             self.notes.push(format!(
                 "phase 2 selected {} (INFO1c={}, far capabilities={:?})",
                 if p2.info1a_pcm().is_some() { "V.90" } else { "V.34" },
@@ -707,6 +720,7 @@ mod fallback_tests {
         let fs = 16_000.0;
         let mut end = Digital::new(crate::v90::server::ours());
         if !decline_pcm { end.failed_starts = V90_RETRAINS + 1; }
+        if decline_pcm { end.last_failure = Some("previous V.90 training timeout"); }
         let mut peer = Analogue::new(fs);
         let mut initial_retrains = 0;
         let mut net = Network::new(Law::Mu, fs).with_delay(0.020, fs).with_noise(1e-5);
@@ -728,6 +742,10 @@ mod fallback_tests {
                 end.v90.as_mut().unwrap().start_retrain();
                 peer.v90.as_mut().unwrap().start_retrain();
                 initial_retrains += 1;
+            }
+            if end.v34.phase2().info1a().is_some() {
+                assert!(end.v90.is_none(), "V.34 selection restarted V.90 training");
+                assert!(end.last_failure.is_none(), "old V.90 failure leaked into V.34 training");
             }
             if matches!(end.status(), Status::Failed(_)) { break; }
             let at_end = end.take_bits();

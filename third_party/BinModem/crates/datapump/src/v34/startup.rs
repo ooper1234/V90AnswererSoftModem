@@ -222,6 +222,10 @@ impl Modem {
         }
     }
 
+    pub fn far_end_silent(&self) -> bool {
+        self.training.as_ref().is_some_and(training::Modem::far_end_silent)
+    }
+
     /// Ask for V.34 in phase 2's INFO1a from now on, even of a V.90 server.
     pub fn decline_pcm(&mut self) {
         self.phase2.decline_pcm();

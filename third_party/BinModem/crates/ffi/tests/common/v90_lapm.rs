@@ -24,22 +24,59 @@ extern "C" fn put_bit(user: *mut c_void, bit: c_int) {
 enum Far { V8(v8line::Modem), Data(Analogue) }
 
 pub fn run(peer_compression: bool, enable_compression: bool) {
-    run_mode(peer_compression, enable_compression, false);
+    run_mode(peer_compression, enable_compression, false, false, false, false, false, false, false);
+}
+
+pub fn run_receive_recovery() {
+    run_mode(true, true, false, false, true, false, false, false, false);
 }
 
 pub fn run_fallback() {
-    run_mode(true, true, true);
+    run_mode(true, true, true, false, false, false, false, false, false);
 }
 
-fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool) {
+pub fn run_fallback_echo() {
+    run_mode(true, true, true, true, false, false, false, false, false);
+}
+
+pub fn run_full_retrain() {
+    run_mode(true, true, false, false, true, true, false, false, false);
+}
+
+pub fn run_fallback_full_retrain() {
+    run_mode(true, true, true, false, true, true, false, false, false);
+}
+
+pub fn run_whole_jump() {
+    run_mode(true, true, false, false, true, false, true, false, false);
+}
+
+pub fn run_caller_rate_changes() {
+    run_mode(true, true, false, false, true, false, false, true, false);
+}
+
+pub fn run_downstream_outage() {
+    run_mode(true, true, false, false, true, false, false, false, true);
+}
+
+fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool, echo: bool, recovery: bool, full_retrain: bool, whole_jump: bool, rate_change: bool, outage: bool) {
     // The default V.90 path must negotiate error control without a bench hook.
     unsafe {
         std::env::remove_var("V90_ERROR_CONTROL");
         if enable_compression { std::env::remove_var("V90_COMPRESSION"); }
         else { std::env::set_var("V90_COMPRESSION", "0"); }
     }
-    let down: Vec<u8> = (0..4096).map(|i| if i < 2048 { b'A' } else { (i * 73 + 19) as u8 }).collect();
-    let up: Vec<u8> = (0..4096).map(|i| if i < 2048 { b'B' } else { (i * 151 + 43) as u8 }).collect();
+    let mut random = 0x4290u32;
+    let mut payload = || -> Vec<u8> {
+        (0..65536).map(|_| {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            random as u8
+        }).collect()
+    };
+    let down: Vec<u8> = if recovery { payload() } else { (0..4096).map(|i| if i < 2048 { b'A' } else { (i * 73 + 19) as u8 }).collect() };
+    let up: Vec<u8> = if recovery { payload() } else { (0..4096).map(|i| if i < 2048 { b'B' } else { (i * 151 + 43) as u8 }).collect() };
     let mut dte = Dte::default();
     let framing = AsyncBits::new(8);
     for &byte in &down { dte.tx.extend(framing.encode(byte)); }
@@ -60,7 +97,18 @@ fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool) {
     let mut sent_up = false;
     let mut far_ready = false;
     let mut far_lapm = false;
-    for tick in 0..(60 * 8000) {
+    let mut reflected = VecDeque::from(vec![0.0; 1320]);
+    let mut data_since = None;
+    // 1960 samples are complete carrier cycles at 3200 and 3429 baud.
+    let mut delayed_up = if whole_jump { VecDeque::from(vec![0.0; 1960]) } else { VecDeque::new() };
+    let mut slips = 0;
+    let mut retrain_requests = 0;
+    let mut next_retrain = None;
+    // Receive recovery has 20 extra seconds for a full physical retrain;
+    // the earlier stalled case still fails this bounded 80-second budget.
+    // With reflection, the analogue peer needs its second V.90 recovery before
+    // selecting V.34. Keep time for that handshake and the verified payload.
+    for tick in 0..(if echo || full_retrain || rate_change || outage { 120 } else if recovery { 80 } else { 60 } * 8000) {
         // Poll then service then step, matching sm_call.c. Service throughout
         // negotiation, since V.42 cannot complete without its line bits.
         if tick % 160 == 0 {
@@ -73,9 +121,33 @@ fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool) {
                 if let Some(byte) = decode.feed(bit) { got_up.push(byte); }
             }
         }
-        let input = net.up(&uplink);
+        if outage && dte.armed { data_since.get_or_insert(tick); }
+        if recovery && !full_retrain && !whole_jump && !rate_change && !outage && dte.armed {
+            let start = *data_since.get_or_insert(tick);
+            // Insert two 20 ms playout jumps during a large compressed duplex
+            // transfer. Every byte must survive through LAPM retransmission.
+            if tick == start + 2 * 8000 || tick == start + 10 * 8000 {
+                delayed_up.extend(std::iter::repeat_n(0.0, 160));
+                slips += 1;
+            }
+        }
+        if whole_jump && dte.armed {
+            let start = *data_since.get_or_insert(tick);
+            if tick == start + 2 * 8000 {
+                assert!(!got_up.is_empty(), "valid upstream data must precede the jump");
+                delayed_up.clear();
+                slips = 1;
+            }
+        }
+        let mut input = net.up(&uplink);
+        if !delayed_up.is_empty() {
+            delayed_up.push_back(input);
+            input = delayed_up.pop_front().unwrap();
+        }
+        input += reflected.pop_front().unwrap();
         uplink.clear();
         let output = bm_step(end, (input * 32768.0).round().clamp(-32768.0, 32767.0) as c_int);
+        reflected.push_back(if echo { 0.13 * output as f64 / 32768.0 } else { 0.0 });
         assert_ne!(bm_status(end), BM_FAILED);
         for mut input in net.down(output as f64 / 32768.0) {
             // Disrupt only initial V.90 training, then allow clean fallback
@@ -94,6 +166,21 @@ fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool) {
                     }
                 }
                 Far::Data(m) => {
+                    if (full_retrain || rate_change) && dte.armed && retrain_requests < 2 {
+                        if matches!(m.status(), Status::Connected { .. }) {
+                            let due = *next_retrain.get_or_insert(tick + 2 * 8000);
+                            if tick >= due {
+                                if rate_change {
+                                    let current=m.rate_menu().and_then(|menu| menu.current).unwrap();
+                                    assert!(m.renegotiate_to(current-1), "caller rate-change request rejected");
+                                } else {
+                                    assert!(m.retrain(), "caller retrain request rejected");
+                                }
+                                retrain_requests += 1;
+                                next_retrain = None;
+                            }
+                        }
+                    }
                     uplink.push(m.step(input));
                     if let Status::Connected { transmit, .. } = m.status() {
                         if ec.is_none() {
@@ -107,7 +194,8 @@ fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool) {
                             ec = Some(stack);
                         }
                         let stack = ec.as_mut().unwrap();
-                        for bit in m.take_bits() { stack.feed_bit(bit); }
+                        let blocked=outage && data_since.is_some_and(|start| (start+2*8000..start+27*8000).contains(&tick));
+                        for bit in m.take_bits() { if !blocked { stack.feed_bit(bit); } }
                         // Two analogue samples for every 8 kHz network tick.
                         if tick % 8 == 0 && uplink.len() == 1 { stack.tick(1); }
                         far_ready = stack.is_connected();
@@ -127,6 +215,7 @@ fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool) {
         }
         if got_down.len() >= down.len() && got_up.len() >= up.len() { break; }
     }
+    if outage { assert!(matches!(&far, Far::Data(m) if m.retrains() >= 1), "stalled downstream did not trigger physical recovery"); }
     let connected = dte.armed;
     let lapm = bm_error_control(end);
     let compression = bm_compression(end);
@@ -134,6 +223,8 @@ fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool) {
     let upstream_rate = bm_rate_rx(end);
     let phase = unsafe { std::ffi::CStr::from_ptr(bm_phase(end)) }.to_string_lossy().into_owned();
     bm_destroy(end);
+    if full_retrain || rate_change { assert_eq!(retrain_requests, 2, "both caller retrains must run during compressed transfer" ); }
+    if rate_change { assert!(matches!(&far, Far::Data(m) if m.retrains() == 0), "rate changes fell into full retraining"); }
     assert!(far_lapm, "the digital V.90 modem did not advertise its enabled LAPM");
     assert!(connected, "V.90/LAPM never opened the DTE gate");
     assert_ne!(lapm, 0);
@@ -149,6 +240,8 @@ fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool) {
         assert!(rate >= 48_000);
         assert_eq!(upstream_rate, 33_600, "full-rate V.90 upstream");
     }
-    assert_eq!(got_down, down, "downstream bytes");
-    assert_eq!(got_up, up, "upstream bytes");
+    assert!(got_down == down, "downstream bytes: received {} of {}", got_down.len(), down.len());
+    assert!(got_up == up, "upstream bytes: received {} of {}", got_up.len(), up.len());
+    if whole_jump { assert_eq!(slips, 1); }
+    if recovery && !full_retrain && !whole_jump && !rate_change && !outage { assert_eq!(slips, 2, "both playout jumps must occur during the transfer"); }
 }

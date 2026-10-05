@@ -5,3 +5,4 @@ Dockerfile text eol=lf
 *.ulaw binary
 *.wav binary
 *.sln binary
+*.patch text eol=lf

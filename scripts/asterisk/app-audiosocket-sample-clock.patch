@@ -1,0 +1,35 @@
+--- a/apps/app_audiosocket.c
++++ b/apps/app_audiosocket.c
+@@ -40,6 +40,7 @@
+ #include "asterisk/app.h"
+ #include "asterisk/res_audiosocket.h"
+ #include "asterisk/utils.h"
++#include "asterisk/time.h"
+ #include "asterisk/format_cache.h"
+ 
+ #define AST_MODULE "app_audiosocket"
+@@ -166,6 +167,7 @@
+ 	int ms = 0;
+ 	int outfd = -1;
+ 	struct ast_frame *f;
++	struct timeval next_delivery = { 0, 0 };
+ 
+ 	if (!chan || ast_channel_state(chan) != AST_STATE_UP) {
+ 		ast_log(LOG_ERROR, "Channel is %s\n", chan ? "not answered" : "missing");
+@@ -206,6 +208,16 @@
+ 				ast_log(LOG_ERROR, "Failed to receive frame from AudioSocket message for"
+ 					"channel %s\n", chanName);
+ 				return -1;
++			}
++			/* AudioSocket has no timestamps. Advance this call's 8 kHz
++			 * audio timeline by samples, not by the host wall clock.
++			 * WSL clock corrections must not create RTP media holes. */
++			if (f->frametype == AST_FRAME_VOICE && f->samples > 0) {
++				if (ast_tvzero(next_delivery)) {
++					next_delivery = ast_tvnow();
++				}
++				f->delivery = next_delivery;
++				next_delivery = ast_tvadd(next_delivery, ast_samp2tv(f->samples, 8000));
+ 			}
+ 			if (ast_write(chan, f)) {
+ 				ast_log(LOG_WARNING, "Failed to forward frame to channel %s\n", chanName);

@@ -181,3 +181,26 @@ fn decode_recorded_digital_capabilities() {
     }
     assert!(found, "recorded digital transmission contains no decodable INFO0d");
 }
+
+#[test]
+#[ignore = "requires local line capture"]
+fn inspect_recorded_retrain_s_detection() {
+    use datapump::v34::{receiver::{Receiver, Heard}, info::SymbolRate, qam::Band};
+    let (rate, samples) = read_wav(&std::env::var("V90_CAPTURE").unwrap());
+    for (start,stop) in [(11.9,12.5),(87.3,92.5),(99.1,104.3)] {
+        for high in [false,true] {
+            let mut rx=Receiver::new(Band::new(SymbolRate::S3200,high),f64::from(rate));
+            rx.hunt(); let mut events=0;
+            for (n,pair) in samples[(start*f64::from(rate)) as usize*2..(stop*f64::from(rate)) as usize*2].chunks_exact(2).enumerate() {
+                rx.feed(f64::from(pair[0])/32768.0);
+                while let Some(event)=rx.heard() {
+                    if matches!(event,Heard::S|Heard::Reversal{..}) {events+=1; println!("{start} high={high} t={} {event:?}",start+n as f64/f64::from(rate));}
+                }
+            }
+            println!("{start} high={high} events={events}");
+            if (start == 11.9 && high) || (start > 80.0 && !high) {
+                assert!(events > 0, "recorded S was missed at {start}, high={high}");
+            }
+        }
+    }
+}

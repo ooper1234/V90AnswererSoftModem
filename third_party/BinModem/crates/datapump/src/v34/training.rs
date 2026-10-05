@@ -855,6 +855,9 @@ impl Modem {
     /// Phase 3 from its start: for the answer modem the moment INFO1a has
     /// gone, for the call modem the moment it has arrived.
     pub fn new(settings: Settings, fs: f64) -> Self {
+        if std::env::var_os("V34_RETRAIN_DIAGNOSTICS").is_some() {
+            eprintln!("V.34 training settings: {settings:?}");
+        }
         let (own, far) = match settings.role {
             Role::Call => (Mode::Call, Mode::Answer),
             Role::Answer => (Mode::Answer, Mode::Call),
@@ -1210,6 +1213,11 @@ impl Modem {
     }
 
     fn enter(&mut self, stage: Stage) {
+        if std::env::var_os("V34_RETRAIN_DIAGNOSTICS").is_some() {
+            eprintln!("V.34 transition: {:?} -> {:?}, snr {:.1}, J-prime {}, heard TRN {}, far MP {:?}",
+                self.stage, stage, self.rx.snr_db(), self.listening.j_prime,
+                self.listening.trn_symbols, self.far_mp);
+        }
         self.stage = stage;
     }
 
@@ -1224,6 +1232,9 @@ impl Modem {
         // line changes too much for one (11.5). Watched on the raw line, since
         // it is a pure tone and not one of the demodulator's signals.
         if live(self.status) && self.stage != Stage::Finished && self.retrain_watch.feed(line, self.fs) {
+            if std::env::var_os("V34_RETRAIN_DIAGNOSTICS").is_some() {
+                eprintln!("V.34 peer retrain at {}: {:?}", self.phase(), self.retrain_watch.took());
+            }
             self.wants_retrain = true;
         }
         while let Some(heard) = self.rx.heard() {
@@ -1232,6 +1243,10 @@ impl Modem {
             }
         }
         if self.stage == Stage::Data && self.now >= self.data_snr_at {
+            if std::env::var_os("V34_RETRAIN_DIAGNOSTICS").is_some() {
+                eprintln!("V.34 data: snr {:.1} dB, rates {:?}, path cost {:?}, slips {}",
+                    self.rx.snr_db(), self.rates(), self.decoder.as_ref().map(Decoder::path_cost), self.rx.slips());
+            }
             self.data_snr_at = self.samples(SNR_EVERY);
             if self.data_snr.len() == SNR_KEPT {
                 self.data_snr.pop_front();
@@ -1268,6 +1283,12 @@ impl Modem {
     /// the start-up that owns this.
     pub fn take_retrain(&mut self) -> bool {
         std::mem::take(&mut self.wants_retrain)
+    }
+
+    /// Phase 3 sends our PP/TRN while the peer waits for our J. The initial
+    /// propagation interval is excluded by the echo fitter's aligned rows.
+    pub fn far_end_silent(&self) -> bool {
+        matches!(self.stage, Stage::AnswerSendTraining | Stage::CallSendTraining)
     }
 
     /// Ask for a full retrain from data mode (11.5.1.1, 11.5.2.1). False, and
@@ -1825,6 +1846,23 @@ mod tests {
             frequency_offset: None,
         };
         Settings::new(role, &far, &info1c, &info1a, round_trip, true)
+    }
+
+    #[test]
+    fn echo_measurement_is_confined_to_our_phase_three_training() {
+        for role in [Role::Call, Role::Answer] {
+            let mut modem = Modem::new(settings(role, 0.4), FS);
+            for stage in [Stage::CallSendTraining, Stage::AnswerSendTraining] {
+                modem.stage = stage;
+                assert!(modem.far_end_silent());
+            }
+            for stage in [Stage::CallAwaitJ, Stage::AnswerAwaitJ, Stage::CallTraining4,
+                Stage::AnswerPhase4, Stage::CallMp, Stage::AnswerMp, Stage::Data,
+                Stage::Renegotiation, Stage::Finished] {
+                modem.stage = stage;
+                assert!(!modem.far_end_silent(), "peer traffic at {stage:?} must not enter the fit");
+            }
+        }
     }
 
     /// Two ends of phases 3 and 4 on a line with a delay each way, a loss,

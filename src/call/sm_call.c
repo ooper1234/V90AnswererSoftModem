@@ -104,6 +104,24 @@ static int call_get_bit(void *ud)
     return (b < 0) ? 1 : b;
 }
 
+/* LAPM has already acknowledged these bytes. A physical retrain must not
+   discard them at the DTE boundary or reset their async framing. */
+static int retains_validated_rx(sm_call_t *c)
+{
+#ifdef SM_HAVE_BM
+    return c->bm && c->ppp_started && bm_error_control(c->bm);
+#else
+    (void)c;
+    return 0;
+#endif
+}
+
+static void reset_unvalidated_rx(sm_call_t *c)
+{
+    if (!retains_validated_rx(c))
+        sm_deframer_init(&c->deframer);
+}
+
 static void call_put_bit(void *ud, int bit)
 {
     sm_call_t *c = ud;
@@ -129,7 +147,7 @@ static void call_put_bit(void *ud, int bit)
     }
     /*endif*/
 #endif
-    if (c->phase != SM_CALL_DATA)
+    if (c->phase != SM_CALL_DATA && !retains_validated_rx(c))
         return;
     sm_deframer_bit(&c->deframer, bit);
 }
@@ -394,10 +412,22 @@ static void pump_ppp(sm_call_t *c)
     }
 
     /* Modem RX -> selector/BBS, pppd, or echo. */
-    if (c->phase == SM_CALL_DATA)
+    if (c->phase == SM_CALL_DATA || retains_validated_rx(c))
     {
         uint8_t tmp[256];
-        int n = sm_deframer_take(&c->deframer, tmp, (int) sizeof(tmp));
+        int limit = (int) sizeof(tmp);
+        /* LAPM has already acknowledged these bytes. Leave them in the
+           deframer until the PPP relay has capacity instead of taking and
+           discarding them when a blocked relay fills ppy_out. */
+        if (c->ppp_started && c->ppp_fd >= 0 && !c->bbs && !c->cfg.echo_data)
+        {
+            int room;
+            ppp_flush(c);
+            room = (int) sizeof(c->ppy_out) - c->ppy_out_len;
+            if (limit > room)
+                limit = room;
+        }
+        int n = sm_deframer_take(&c->deframer, tmp, limit);
         int off = 0;
 
         if (n > 0 && c->cfg.echo_data)
@@ -491,14 +521,22 @@ static void pump_ppp(sm_call_t *c)
         ppp_flush(c);
     }
 
-    /* pppd -> modem TX. Read regardless of phase so pppd never blocks; the
-       bits wait in the queue until the modem reaches data mode. */
+    /* pppd -> modem TX. Stage bytes during training, but leave excess bytes
+       in the relay until the modem makes room. Consuming a fixed-size read
+       during a long retrain used to discard its tail when txbits filled. */
     {
         uint8_t tmp[256];
         ssize_t r;
+        size_t queued, room;
         if (c->ppp_fd < 0)
             return;
-        r = read(c->ppp_fd, tmp, sizeof(tmp));
+        queued = sm_bitq_count(&c->txbits);
+        room = queued < SM_BITQ_SIZE ? (SM_BITQ_SIZE - queued) / 10 : 0;
+        if (room == 0)
+            return;
+        if (room > sizeof(tmp))
+            room = sizeof(tmp);
+        r = read(c->ppp_fd, tmp, room);
         if (r > 0)
         {
             int i;
@@ -618,9 +656,9 @@ static void bm_poll(sm_call_t *c, int n)
 
     if (st == BM_RETRAINING  &&  c->phase == SM_CALL_DATA)
     {
-        /* A retrain resets the link; drop partial async state, as the
-           V.22bis retrain status does. */
-        sm_deframer_init(&c->deframer);
+        /* Raw demodulator bits are training noise; validated LAPM bytes
+           remain part of the established PPP stream through a retrain. */
+        reset_unvalidated_rx(c);
         c->phase = SM_CALL_HANDSHAKE;
         c->bm_nocarrier = 0;
         sm_log_message(&c->log, SM_LOG_FLOW, "binmodem: retrain");
@@ -635,7 +673,7 @@ static void bm_poll(sm_call_t *c, int n)
             /* Everything the receiver made of the handshake is noise; the
                engine's own integrator says the same. */
             bm_flush_rx(c->bm);
-            sm_deframer_init(&c->deframer);
+            reset_unvalidated_rx(c);
             c->phase = SM_CALL_DATA;
             c->negotiated_rate = rate;
             sm_log_message(&c->log, SM_LOG_FLOW,

@@ -389,12 +389,14 @@ impl Hunt {
             let c = half * before.conj();
             let p = (half.norm_sqr() + before.norm_sqr()) / 2.0;
             self.correlations.push_back((c, p));
-            if self.correlations.len() > 8 {
+            // Average twenty symbols so short noisy dips do not erase S.
+            // The held-run requirement still rejects brief periodic bursts.
+            if self.correlations.len() > 40 {
                 self.correlations.pop_front();
             }
             let (sum_c, sum_p) =
                 self.correlations.iter().fold((Complex::ZERO, 0.0), |(sc, sp), &(c, p)| (sc + c, sp + p));
-            let s_like = sum_c.re > 0.7 * sum_p && sum_p / self.correlations.len() as f64 > AUDIBLE;
+            let s_like = self.correlations.len() == 40 && sum_c.re > 0.55 * sum_p && sum_p / self.correlations.len() as f64 > AUDIBLE;
             if s_like {
                 self.held += 1;
                 // Averaged over the last stretch of S, weighted to the newest.
@@ -1570,6 +1572,25 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn s_hunt_accepts_noisy_periodic_training_but_rejects_random_data() {
+        let mut seed=0x13579bdu32;
+        let mut noise=|| { seed^=seed<<13;seed^=seed>>17;seed^=seed<<5; (seed as f64/u32::MAX as f64)*2.0-1.0 };
+        let mut hunt=Hunt::default();
+        for n in 0..20_000 {
+            let point=Complex::new(noise(),noise());
+            assert!(hunt.feed(point,n).is_none(),"random data accepted at {n}");
+        }
+        let pattern=[Complex::new(1.0,1.0),Complex::I,Complex::new(-1.0,1.0),Complex::I];
+        let mut hunt=Hunt::default();
+        let mut heard=false;
+        for n in 0..256 {
+            let point=pattern[n%4]+Complex::new(noise(),noise()).scale(1.1);
+            if matches!(hunt.feed(point,n as u64),Some(Hunted::S)) {heard=true;break;}
+        }
+        assert!(heard,"noisy S never armed");
     }
 
     #[test]

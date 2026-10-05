@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 
 use crate::v32::{Mode, Scrambler};
-use crate::v34::data::{Decoder as UpstreamDecoder, Params};
+use crate::v34::data::{Acquired, Acquirer as UpstreamAcquirer, Decoder as UpstreamDecoder, Params};
 use crate::v34::frame::Framing;
 use crate::v34::info::{Info1aPcm, Info1c};
 use crate::v34::mp::{Mp, Trellis};
@@ -145,9 +145,9 @@ impl Habits {
     /// Short TRN1d, and the Recommendation's wait for S.
     pub const PROMPT: Self = Self { trn1d: 0.3, s_wait_counts_round_trip: true };
 
-    /// What a live server did: four seconds of TRN1d, and a wait for S that
-    /// did not allow for a second-long round trip.
-    pub const LIVE_SERVER: Self = Self { trn1d: 4.05, s_wait_counts_round_trip: false };
+    /// Long training, within the 4000 ms Jd deadline at a six-sample boundary.
+    /// The S deadline includes the measured round trip (9.3.1.4-5).
+    pub const LIVE_SERVER: Self = Self { trn1d: 3.996, s_wait_counts_round_trip: true };
 }
 
 impl Default for Habits {
@@ -520,7 +520,8 @@ impl Source {
             }
             Out::Ed if self.count == ED_FRAMES => Some(Out::B1d),
             Out::B1d if self.count == B1D_FRAMES => Some(Out::Data),
-            Out::Data => self.pending,
+            // Consume the request before flushing: otherwise it survives into MP.
+            Out::Data => self.pending.take(),
             _ => None,
         };
         let Some(out) = next else { return false };
@@ -855,6 +856,8 @@ pub struct Modem {
     cp_kept: Option<Cp>,
     far_e: bool,
     decoder: Option<UpstreamDecoder>,
+    acquirer: Option<UpstreamAcquirer>,
+    blind_acquisition_started: bool,
     b1_left: usize,
     /// How many equalised points `V90_DATA_POINTS` has taken this call.
     points_written: usize,
@@ -870,6 +873,8 @@ pub struct Modem {
     retrain_watch: RetrainWatch,
     wants_retrain: bool,
     data_lost_since: Option<u64>,
+    /// Receive resynchronization restores the grid, but not the data-frame clock.
+    data_slips: u32,
     /// What asked for the retrain, for the transcript: the tone, the
     /// deadline's own words, or the modem above.
     retrain_why: Option<&'static str>,
@@ -900,6 +905,7 @@ pub struct Modem {
     retry_at: Option<u64>,
     /// The analogue modem's S after Ja, and when it has to have come by.
     s_heard: bool,
+    jd_listening: bool,
     s_deadline: Option<u64>,
     /// The analogue modem's S and S-bar, which begin or answer a rate
     /// renegotiation (9.6.1.2); whether S-bar has been heard in this one.
@@ -943,6 +949,8 @@ impl Modem {
             cp: None,
             far_e: false,
             decoder: None,
+            acquirer: None,
+            blind_acquisition_started: false,
             b1_left: 0,
         cp_kept: None,
             points_written: 0,
@@ -954,6 +962,7 @@ impl Modem {
             retrain_watch: RetrainWatch::new(Role::Answer, FS),
             wants_retrain: false,
             data_lost_since: None,
+            data_slips: 0,
             retrain_why: None,
             trace: Vec::new(),
             far_peak: 0.0,
@@ -968,6 +977,7 @@ impl Modem {
             rbar_tries: 0,
             retry_at: None,
             s_heard: false,
+            jd_listening: false,
             s_deadline: None,
             s_watch: SWatch::default(),
             far_s_bar: false,
@@ -1360,6 +1370,14 @@ impl Modem {
                 self.rx.band().carrier()
             ));
         }
+        // A jitter-buffer jump can leave a clean constellation with the
+        // trellis/shell/inversion frame clocks at the wrong position. Obtain
+        // a fresh E/B1 boundary rather than decoding that stream indefinitely.
+        if self.in_data_mode() && self.b1_left == 0 && self.rx.slips() != self.data_slips {
+            self.data_slips = self.rx.slips();
+            self.say("receive resynchronization: searching for upstream data framing");
+            self.start_upstream_acquisition();
+        }
         // A continuous loss of receive lock cannot deliver PPP data. Give
         // brief disturbances time to settle, then use the existing full
         // retrain path rather than leaving the call connected but unreadable.
@@ -1429,9 +1447,8 @@ impl Modem {
 
     /// From data mode to Rd (9.6.1.1.1, 9.6.1.2.2), and phase 4 after it.
     ///
-    /// The answering end starts on S rather than on S turning into S-bar,
-    /// as V.34's does: sooner, over a line where every millisecond of a
-    /// round trip is already on the far end's clock.
+    /// A caller-initiated change clamps receive data on S, but Rd begins
+    /// only after S-to-S-bar (9.6.1.2.1-2), on a data-frame boundary.
     fn begin_renegotiation(&mut self, initiating: bool) {
         let (Some(cp), Some(cpt)) = (self.cp.take(), self.cpt.as_ref()) else { return };
         let Some(training) = Mapping::for_renegotiation(cpt, &cp) else {
@@ -1448,11 +1465,15 @@ impl Modem {
         self.source.sending_acknowledged = false;
         self.source.acknowledged = 0;
         self.source.mps_sent = 0;
-        self.source.change(Out::Rd);
+        if initiating {
+            self.source.change(Out::Rd);
+        }
         self.far_e = false;
         self.far_s_bar = false;
         self.cps = CpFinder::default();
         self.ones = 0;
+        self.acquirer = None;
+        self.blind_acquisition_started = false;
         if initiating {
             // The analogue modem's data is data until its S (9.6.1.2.1).
             self.s_watch = SWatch::default();
@@ -1473,6 +1494,13 @@ impl Modem {
     }
 
     fn heard_far_s_bar(&mut self) {
+        if self.renegotiating && self.source.out == Out::Data && self.source.pending.is_none() {
+            self.source.change(Out::Rd);
+            let rd = (RD_SYMBOLS + (R_BAR_FRAMES + 1) * INTERVALS) as f64 / FS;
+            self.deadline = Some((self.samples(RENEGOTIATION_E + 2.0 * self.settings.round_trip + rd),
+                "no E in the rate renegotiation"));
+            self.say("caller S-to-S-bar heard: Rd at the next data-frame boundary");
+        }
         self.far_s_bar = true;
         self.cps = CpFinder::default();
         self.ones = 0;
@@ -1494,6 +1522,14 @@ impl Modem {
     fn stage_step(&mut self) {
         match self.stage {
             Stage::SendJd => {
+                if self.source.out == Out::Jd && !self.jd_listening {
+                    // 9.3.1.4 starts S detection with Jd. An early indication
+                    // during Sd/TRN1d must not latch a false S or consume the
+                    // receiver's hunt before the caller's actual response.
+                    self.rx.hunt();
+                    self.s_heard = false;
+                    self.jd_listening = true;
+                }
                 if self.source.out == Out::Trn1d && self.s_deadline.is_none() {
                     let trip = if self.settings.habits.s_wait_counts_round_trip { self.settings.round_trip } else { 0.0 };
                     self.s_deadline = Some(self.samples(S_WITHIN + trip));
@@ -1520,6 +1556,15 @@ impl Modem {
                 }
             }
             Stage::Phase4Cp => {
+                if !self.far_e && !self.blind_acquisition_started
+                    && self.cp.as_ref().is_some_and(|cp| cp.acknowledge)
+                    && self.source.out == Out::Data
+                    && self.ed_at.is_some_and(|at| self.now > at + ((0.25 + 2.0 * self.settings.round_trip) * FS) as u64)
+                {
+                    self.blind_acquisition_started = true;
+                    self.say("CP acknowledged but E missed: verifying upstream data framing");
+                    self.start_upstream_acquisition();
+                }
                 // 9.4.1.4: an MP' sent, and CP' or E heard.
                 let heard_back = self.cp.as_ref().is_some_and(|cp| cp.acknowledge) || self.far_e;
                 if self.source.out == Out::Mp && self.source.acknowledged >= 1 && heard_back && self.source.pending.is_none() {
@@ -1534,6 +1579,7 @@ impl Modem {
                 if self.ed_tries > 0
                     && self.ed_tries < ED_TRIES
                     && !self.far_e
+                    && self.acquirer.is_none()
                     && self.source.out == Out::Data
                     && self.source.pending.is_none()
                     && self.now > self.ed_at.unwrap_or(0) + (ED_RETRY * FS) as u64
@@ -1594,9 +1640,7 @@ impl Modem {
 
     fn heard(&mut self, heard: Heard) {
         match heard {
-            // Kept until Jd is going out, which is when 9.3.1.4 has the
-            // receiver listen for it.
-            Heard::S if self.stage == Stage::SendJd => {
+            Heard::S if self.stage == Stage::SendJd && self.source.out == Out::Jd => {
                 if !self.s_heard {
                     self.say("the analogue modem's S heard");
                 }
@@ -1684,6 +1728,8 @@ impl Modem {
         self.rbar_tries = 0;
         self.retry_at = None;
         self.stage = Stage::Phase4Cpt;
+        self.acquirer = None;
+        self.blind_acquisition_started = false;
         // V90_P4_AT moves where phase 4 starts reading, in half symbols: a
         // bench hook for how far the CPt's grid is from where the S-bar left
         // it, which is what the receiver has to find on a real line.
@@ -1799,6 +1845,33 @@ impl Modem {
                         self.bias_left -= 1;
                     }
                 }
+                if let Some(acquirer) = self.acquirer.as_mut() {
+                    match acquirer.feed(symbol.point) {
+                        Acquired::Searching => {}
+                        Acquired::Found(decoder) => {
+                            self.say("upstream data framing acquired from the superframe pattern");
+                            self.decoder = Some(*decoder);
+                            self.acquirer = None;
+                            self.data_slips = self.rx.slips();
+                            self.stage = Stage::Data;
+                            self.far_e = true;
+                            self.ed_tries = ED_TRIES;
+                            self.renegotiating = false;
+                            self.s_watch = SWatch::default();
+                            self.far_s_bar = false;
+                            self.deadline = None;
+                        }
+                        Acquired::Nothing => {
+                            self.acquirer = None;
+                            if self.stage == Stage::Data {
+                                self.start_upstream_acquisition();
+                            } else {
+                                self.rx.set_size(self.cp_size());
+                            }
+                        }
+                    }
+                    return;
+                }
                 if let Some(decoder) = self.decoder.as_mut() {
                     // V90_DATA_POINTS writes the equalised points the data-mode
                     // decoder is fed, one per line, as `now re im`, where `now`
@@ -1913,9 +1986,11 @@ impl Modem {
         self.descriptor = Some(descriptor);
         self.source.change(Out::Sd);
         self.stage = Stage::SendJd;
-        // The analogue modem goes quiet on hearing S-bar-d. Its S after Jd is
-        // what is listened for now.
-        self.rx.hunt();
+        // The analogue modem goes quiet after S-bar-d. Listen for its new S
+        // only when Jd starts, as 9.3.1.4 specifies.
+        self.s_heard = false;
+        self.jd_listening = false;
+        self.rx.idle();
     }
 
     fn heard_cp(&mut self, cp: Cp) {
@@ -1966,9 +2041,8 @@ impl Modem {
         self.cp = Some(cp);
     }
 
-    fn heard_e(&mut self) {
-        self.far_e = true;
-        let (Some(ours), Some(cp)) = (self.source.mp, self.cp.as_ref()) else { return };
+    fn upstream_params(&mut self) -> Option<Params> {
+        let (Some(ours), Some(cp)) = (self.source.mp, self.cp.as_ref()) else { return None };
         let rate = upstream_rate(cp, &ours);
         self.upstream_rate = u32::from(rate) * 2400;
         // V90_UP_RATE, in bit/s, takes the upstream rate the masks give: the
@@ -1986,21 +2060,10 @@ impl Modem {
         };
         let Some(framing) = Framing::new(self.settings.upstream.rate, self.upstream_rate, false, expanded) else {
             self.fail("no upstream rate both ends allow");
-            return;
+            return None;
         };
-        // 9.4.1.6: B1 next, then data.
-        self.say(format!("E heard: B1d going out at {} bit/s, waiting for B1", self.upstream_rate));
-        self.ed_tries = ED_TRIES;
-        // What the analogue modem's transmitter is to do, which the MP asks
-        // for: the trellis, the nonlinear encoder and the shaping. A real
-        // modem need not take the MP's word for it, so V90_UP_TRELLIS (16, 32
-        // or 64), V90_UP_NONLINEAR and V90_UP_EXPANDED take each of them, to
-        // sweep a recording for the set the far end is really using.
-        let code = match std::env::var("V90_UP_TRELLIS").ok().and_then(|v| v.parse::<u8>().ok()) {
-            Some(32) => Code::States32,
-            Some(64) => Code::States64,
-            _ => Code::States16,
-        };
+        // Decode the same trellis advertised to the caller in our MP.
+        let code = upstream_code(ours.trellis);
         let nonlinear = match std::env::var("V90_UP_NONLINEAR").ok().as_deref() {
             Some("1") => true,
             _ => ours.non_linear,
@@ -2015,7 +2078,49 @@ impl Modem {
             Some("call") => Mode::Call,
             _ => Mode::Answer,
         };
-        let params = Params { framing, code, nonlinear, precoding: [(0, 0); 3], mode };
+        Some(Params { framing, code, nonlinear, precoding: [(0, 0); 3], mode })
+    }
+
+    /// Recover the receive frame clock without resetting LAPM or the far end.
+    /// A valid carrier can survive a whole-symbol jump with invalid framing.
+    pub fn recover_upstream_framing(&mut self) -> bool {
+        if self.in_data_mode() && self.b1_left == 0 && self.decoder.is_some() {
+            self.say("receive resynchronization: sustained invalid LAPM framing");
+            self.start_upstream_acquisition();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn start_upstream_acquisition(&mut self) {
+        let Some(params) = self.upstream_params() else { return };
+        // Recovering only the receive frame clock does not change the far
+        // end's downstream decoder. Keep supplying its LAPM stream while
+        // upstream symbols are withheld until their framing is validated.
+        // Initial acquisition and actual renegotiations still report Running.
+        let receive_only = self.stage == Stage::Data
+            && self.source.out == Out::Data
+            && self.in_data_mode();
+        let acquirer = UpstreamAcquirer::new(params);
+        self.rx.set_grid(acquirer.grid_scale(), acquirer.extent());
+        self.decoder = None;
+        self.acquirer = Some(acquirer);
+        self.b1_left = 0;
+        if !receive_only {
+            self.status = Status::Running;
+        }
+    }
+
+    fn heard_e(&mut self) {
+        self.far_e = true;
+        let Some(params) = self.upstream_params() else { return };
+        let framing = params.framing;
+        let code = params.code;
+        let nonlinear = params.nonlinear;
+        self.say(format!("E heard: B1d going out at {} bit/s, waiting for B1", self.upstream_rate));
+        self.ed_tries = ED_TRIES;
+        self.acquirer = None;
         let decoder = UpstreamDecoder::new(params);
         // What the slicer's grid is, in the numbers that decide it. Every
         // measurement so far has said the receiver is decoding noise, and a
@@ -2038,6 +2143,7 @@ impl Modem {
         ));
         self.rx.set_grid(decoder.grid_scale(), decoder.extent());
         self.b1_left = framing.n;
+        self.data_slips = self.rx.slips();
         self.decoder = Some(decoder);
         self.stage = Stage::Data;
         // Listening for the next renegotiation's S.
@@ -2071,7 +2177,7 @@ impl Modem {
             // 9.7: "drn = 0 indicates cleardown".
             answer_to_call: if self.clearing { 0 } else { upstream },
             auxiliary: false,
-            trellis: Trellis::States16,
+            trellis: requested_upstream_trellis(std::env::var("V90_UP_TRELLIS").ok().as_deref()),
             non_linear: false,
             expanded_shaping: false,
             acknowledge: false,
@@ -2079,6 +2185,23 @@ impl Modem {
             asymmetric: false,
             precoding: None,
         }
+    }
+}
+
+/// Select the transmitter coding before MP negotiation, not only in the decoder.
+fn requested_upstream_trellis(setting: Option<&str>) -> Trellis {
+    match setting {
+        Some("32") => Trellis::States32,
+        Some("64") => Trellis::States64,
+        _ => Trellis::States16,
+    }
+}
+
+fn upstream_code(trellis: Trellis) -> Code {
+    match trellis {
+        Trellis::States16 => Code::States16,
+        Trellis::States32 => Code::States32,
+        Trellis::States64 => Code::States64,
     }
 }
 
@@ -2114,6 +2237,62 @@ fn held_loss(since: &mut Option<u64>, now: u64, lost: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_profile_starts_jd_inside_4000ms() {
+        let mut source=Source::new(Law::Mu,79,Jd::default(),Habits::LIVE_SERVER.trn1d);
+        source.start(Out::Trn1d);
+        let mut samples=0;
+        while source.out!=Out::Jd && samples<=4*FS as usize {source.next();samples+=1;}
+        assert_eq!(source.out,Out::Jd);
+        assert!(samples<=4*FS as usize,"Jd started after the mandatory deadline");
+        assert!(Habits::LIVE_SERVER.s_wait_counts_round_trip);
+    }
+
+    #[test]
+    fn phase_three_ignores_s_until_jd_starts() {
+        use crate::v34::info::{Info1aPcm,Info1c,SymbolRate};
+        let asked=Info1aPcm{md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None};
+        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,0.020,true));
+        m.stage=Stage::SendJd;m.source.start(Out::Trn1d);
+        m.heard(Heard::S);
+        assert!(!m.s_heard,"TRN1d indication must not answer a Jd that was not sent");
+        m.stage_step();assert!(!m.jd_listening);
+        m.source.start(Out::Jd);m.stage_step();assert!(m.jd_listening);
+        m.heard(Heard::S);m.stage_step();
+        assert_eq!(m.source.pending,Some(Out::JdPrime));
+        assert_eq!(m.stage,Stage::AwaitFirstReversal);
+    }
+
+    #[test]
+    fn caller_rate_change_waits_for_s_reversal_before_rd() {
+        use crate::v34::info::{Info1aPcm, Info1c, SymbolRate};
+        let asked=Info1aPcm { md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None };
+        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,0.020,true));
+        let mask=(1u128<<88)-1;
+        let cpt=Cp {drn:1,constellations:vec![mask],..Cp::default()};
+        let cp=Cp {data_mode:true,drn:1,constellations:vec![mask],..cpt.clone()};
+        m.cpt=Some(cpt);
+        m.source.data_mode=Mapping::from_cp(&cp);
+        m.cp=Some(cp);
+        m.source.start(Out::Data);
+        m.stage=Stage::Data;
+        m.begin_renegotiation(false);
+        assert!(m.source.pending.is_none(),"responding Rd must wait for caller S-to-S-bar transition");
+        for _ in 0..64 {m.source.next();}
+        assert_eq!(m.source.out,Out::Data);
+        m.heard_far_s_bar();
+        assert_eq!(m.source.pending,Some(Out::Rd));
+    }
+
+    #[test]
+    fn upstream_coding_matches_the_advertised_trellis() {
+        for (setting, expected) in [(None, Code::States16), (Some("16"), Code::States16),
+            (Some("32"), Code::States32), (Some("64"), Code::States64),
+            (Some("invalid"), Code::States16)] {
+            assert_eq!(upstream_code(requested_upstream_trellis(setting)), expected);
+        }
+    }
 
     #[test]
     fn training_snr_reserves_margin_for_the_data_path() {
@@ -2216,4 +2395,30 @@ mod tests {
         let got: Vec<bool> = read(&mut source, sent.len() / d, &mut decoder, &mut descrambler).concat();
         assert_eq!(got[..], sent[..got.len()]);
     }
+    #[test]
+    fn data_renegotiation_consumes_the_request_before_flushing() {
+        let mut source = Source::new(Law::Mu, 79, Jd::default(), 0.3);
+        source.training = Some(shaped());
+        source.data_mode = Some(shaped());
+        source.mp = Some(Mp::default());
+        source.start(Out::B1d);
+        for _ in 0..(B1D_FRAMES + 8) * INTERVALS {
+            source.next();
+        }
+        assert_eq!(source.out, Out::Data);
+        source.change(Out::Rd);
+        for _ in 0..20000 {
+            source.next();
+            if source.out == Out::Mp {
+                assert!(source.pending.is_none(), "stale Rd request would restart renegotiation after MP");
+                for _ in 0..2000 {
+                    source.next();
+                    assert_eq!(source.out, Out::Mp);
+                }
+                return;
+            }
+        }
+        panic!("renegotiation never reached MP");
+    }
+
 }

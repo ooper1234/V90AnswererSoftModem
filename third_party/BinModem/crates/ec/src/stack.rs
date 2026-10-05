@@ -198,6 +198,8 @@ pub struct Stack {
     /// Frames that arrived but could not be read, which is the measure of how
     /// the line is behaving.
     damaged: u64,
+    valid_frames: u64,
+    valid_information_frames: u64,
     /// Every frame either way, until somebody takes them.
     log: Vec<Crossed>,
     phase: Phase,
@@ -414,6 +416,8 @@ impl Stack {
             compression: None,
             delivered: Vec::new(),
             damaged: 0,
+            valid_frames: 0,
+            valid_information_frames: 0,
             log: Vec::new(),
             phase: Phase::Detecting,
             detect: Detect::start(role, crate::detect::DEFAULT_T400_MS, false),
@@ -603,6 +607,13 @@ impl Stack {
     }
 
     fn enable_compression(&mut self, params: v42bis::Params) {
+        // Retried XID exchanges do not establish a new data link. Preserve
+        // the dictionaries that outstanding I frames still depend on.
+        // Actual link establishment/reset reinitializes them in drain().
+        if self.compression.as_ref().is_some_and(|c| !c.speculative
+            && matches!(&c.codec, Codec::V42bis(b) if b.params == params)) {
+            return;
+        }
         self.compression = Some(Compressor {
             codec: Codec::V42bis(Box::new(Btlz {
                 encoder: v42bis::Encoder::new(params),
@@ -615,6 +626,10 @@ impl Stack {
 
     /// The same, for the newer one.
     fn enable_v44(&mut self, transmit: v44::Params, receive: v44::Params) {
+        if self.compression.as_ref().is_some_and(|c| !c.speculative
+            && matches!(&c.codec, Codec::V44(b) if b.transmit == transmit && b.receive == receive)) {
+            return;
+        }
         self.compression = Some(Compressor {
             codec: Codec::V44(Box::new(Lzjh {
                 encoder: v44::Encoder::new(transmit),
@@ -725,6 +740,23 @@ impl Stack {
     pub fn is_connected(&self) -> bool {
         self.lapm.is_connected()
     }
+
+    pub fn stalled_transmit_ms(&self) -> Option<u32> {
+        self.lapm.stalled_transmit_ms()
+    }
+
+
+    /// Intact, decodable LAPM frames, including supervisory traffic.
+    pub fn valid_frames(&self) -> u64 {
+        self.valid_frames
+    }
+
+    /// Intact information frames, so short supervisory frames do not mask
+    /// a receiver that cannot decode sustained data.
+    pub fn valid_information_frames(&self) -> u64 {
+        self.valid_information_frames
+    }
+
 
     /// Frames that arrived damaged and were dropped.
     pub fn damaged_frames(&self) -> u64 {
@@ -954,6 +986,8 @@ impl Stack {
             self.damaged += 1;
             return;
         };
+        self.valid_frames += 1;
+        if matches!(frame, Frame::I { .. }) { self.valid_information_frames += 1; }
         self.dispatch(address, frame);
     }
 
@@ -1301,6 +1335,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn supervisory_frames_do_not_count_as_valid_information() {
+        let mut stack=Stack::new(Role::Answerer,Params::default());stack.phase=Phase::Protocol;
+        for frame in [Frame::Rr{nr:0,pf:false},Frame::I{ns:0,nr:0,poll:false,info:vec![1]}] {
+            let mut encoder=Encoder::new(Fcs::Bits16);
+            encoder.frame(&frame.encode(DLCI_DATA,Role::Originator,Kind::Command));
+            while let Some(bit)=encoder.next_bit(){stack.feed_bit(bit);}
+            if matches!(frame,Frame::Rr{..}) {assert_eq!(stack.valid_information_frames(),0);}
+        }
+        assert_eq!(stack.valid_frames(),2);assert_eq!(stack.valid_information_frames(),1);
+    }
+
     fn pair() -> (Stack, Stack) {
         (
             Stack::new(Role::Originator, Params::default()),
@@ -1542,6 +1588,46 @@ mod tests {
         b.send(&after);
         settle(&mut a, &mut b, 200_000, |_, bit| bit);
         assert_eq!(a.take_received(), after, "and not the other way either");
+    }
+
+    #[test]
+    fn repeated_xid_preserves_active_compression_dictionaries() {
+        check_repeated_xid(false);
+    }
+
+    #[test]
+    fn repeated_xid_preserves_active_v44_dictionaries() {
+        check_repeated_xid(true);
+    }
+
+    fn check_repeated_xid(v44: bool) {
+        let (mut a, mut b) = negotiated_pair();
+        if !v44 {
+            a.without_v44();
+            b.without_v44();
+        }
+        a.connect();
+        settle(&mut a, &mut b, 40_000, |_, bit| bit);
+        assert!(a.is_connected() && b.is_connected());
+        assert_eq!(a.compression_name(), Some(if v44 { "V.44" } else { "V.42bis" }));
+        let warm = b"dictionary entries learned before the repeated negotiation\r\n".repeat(200);
+        a.send(&warm);
+        b.send(&warm);
+        settle(&mut a, &mut b, 200_000, |_, bit| bit);
+        assert_eq!(a.take_received(), warm);
+        assert_eq!(b.take_received(), warm);
+        assert!(a.compressing() && b.compressing());
+
+        // The peer can retry the same parameter exchange after the data link
+        // is established. Answer it without resetting one side's dictionaries.
+        a.send(&warm);
+        b.send(&warm);
+        b.receive_xid(a.proposal().encode(Kind::Command), Kind::Command);
+        settle(&mut a, &mut b, 200_000, |_, bit| bit);
+        assert_eq!(a.take_received(), warm, "downstream dictionary survived repeated XID");
+        assert_eq!(b.take_received(), warm, "upstream dictionary survived repeated XID");
+        assert_eq!(a.undecodable, 0);
+        assert_eq!(b.undecodable, 0);
     }
 
     /// A negotiated pair, the way a call makes one: XID settles compression

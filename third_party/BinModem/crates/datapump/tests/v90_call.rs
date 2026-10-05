@@ -358,6 +358,36 @@ fn a_retrain_from_either_end_comes_back_up() {
     }
 }
 
+#[test]
+fn repeated_caller_retrains_over_400ms_round_trip_come_back_up() {
+    use datapump::v90::startup::Status;
+    for from_server in [false] {
+        let mut call = connects(Network::new(Law::Mu, FS).with_delay(0.200, FS).with_noise(1e-5), server(), 45.0);
+        let up = |s: Status| matches!(s, Status::Connected { .. });
+        for _attempt in 0..2 {
+        assert!(if from_server { call.digital.retrain() } else { call.analogue.retrain() });
+        // Down, then up again.
+        let start = call.ticks;
+        let mut went_down = false;
+        while call.ticks < start + 45 * 8000 {
+            call.run_until_seconds((call.ticks + 800) as f64 / 8000.0);
+            if !up(call.analogue.status()) {
+                went_down = true;
+            }
+            if went_down && up(call.analogue.status()) && up(call.digital.status()) {
+                break;
+            }
+        }
+        println!("from the server {from_server}: {:?} {:?}", call.analogue.status(), call.digital.status());
+        assert!(went_down, "the call never left data mode");
+        assert!(up(call.analogue.status()) && up(call.digital.status()), "the retrain never came back up");
+        assert!(call.analogue.is_v90());
+        assert_eq!(call.carries_data(3.0), (true, true), "from the server {from_server}");
+        }
+    }
+}
+
+
 /// A softphone's beep at the end of a call, after the server has gone quiet:
 /// 1200 Hz for 200 ms, 10 dB under the server's tone B as phase 2 heard it
 /// (live-1790032877). It is not the server retraining, and the analogue
@@ -1859,4 +1889,40 @@ fn the_rate_menu_in_data_mode_renegotiates_to_the_rate_chosen() {
     assert_eq!(call.analogue.retrains(), 0, "a retrain happened");
     assert_eq!(call.analogue.renegotiations(), 2);
     let _ = down;
+}
+
+/// A receive jitter buffer inserts one 20 ms packet in the caller-to-server
+/// direction. A recovered constellation must also recover the data framing.
+#[test]
+fn an_upstream_packet_slip_recovers_data_framing() {
+    use std::collections::VecDeque;
+    let mut call = check_connects(Network::new(Law::Mu, FS).with_delay(0.020, FS).with_noise(1e-5));
+    let mut queued = VecDeque::new();
+    let sent = pattern(8000, 761);
+    let mut got = Vec::new();
+    let mut downstream_paused = 0;
+    for n in 0..(14 * 8000) {
+        queued.push_back(call.net.up(&call.up));
+        call.up.clear();
+        let input = if n < 160 { 0.0 } else { queued.pop_front().unwrap() };
+        let from_digital = call.digital.step(input);
+        if call.digital.phase() == "V.90 data"
+            && matches!(call.digital.status(), digital::Status::Running)
+        {
+            downstream_paused += 1;
+        }
+        for x in call.net.down(from_digital) {
+            call.up.push(call.analogue.step(x));
+        }
+        call.ticks += 1;
+        if n == 10 * 8000 {
+            call.digital.take_bits();
+            call.analogue.send_bits(&sent);
+        }
+        if n >= 10 * 8000 {
+            got.extend(call.digital.take_bits());
+        }
+    }
+    assert!(contains(&got, &sent), "upstream framing remained corrupt after the receive packet slip");
+    assert_eq!(downstream_paused, 0, "receive-only frame acquisition paused downstream data feeding");
 }
