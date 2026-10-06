@@ -564,6 +564,10 @@ impl Digital {
         self.v90.as_mut().is_some_and(|m| m.recover_upstream_framing())
     }
 
+    /// Full DIL collection window for the digital answerer's echo estimator.
+    pub fn echo_training_window(&self) -> bool {
+        self.v90.as_ref().map_or_else(|| self.v34.far_end_silent(), |m| m.echo_training_window())
+    }
     /// Start a full retrain (9.5.1.1).
     pub fn retrain(&mut self) -> bool {
         match self.v90.as_mut() {

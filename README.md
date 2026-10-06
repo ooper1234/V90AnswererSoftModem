@@ -7,6 +7,26 @@ PPP networking. It is an experimental modem implementation.
 
 ## What was tested
 
+October 6 reliability updates add bounded V.90 receiver acquisition recovery,
+same-rate renegotiation before full retraining for receive-framing and
+acknowledgement stalls, a V.42bis byte-aligned FLUSH correction, and bounded
+PPP recovery for the Linux PPP-unit reattach failure. The optional dedicated
+PPP VPN backend supports four private client addresses; see
+[multilink setup](scripts/multilink/README.md). VPN profiles and credentials
+must be supplied separately.
+
+Offline checks passed 12 V.90 digital unit tests, 43 FFI unit tests (four
+recording-dependent tests skipped), and six duplex/retrain/outage integration
+tests. Two independent BinModem clients were observed concurrently with PPP,
+V.42/V.42bis, and continuing bidirectional traffic at 28,800 bit/s upstream
+and 56,000 / 52,000 bit/s downstream.
+
+Long hardware stability remains unresolved: the latest single-modem trial
+completed both HTTPS downloads and six total byte-perfect 16 KiB transfer
+rounds, but PPP disconnected after 19.9 minutes. Gateway ping returned
+203/220 replies, with recovery delays up to 63.3 seconds. These updates are
+experimental and do not establish reliable 30-minute service.
+
 On October 1, 2026, a Conexant CX93010 USB modem on Windows COM30 called
 through a PAP2T Line 2 into Asterisk 20.6.0. Real V.90 calls reported
 45,333–46,667 bit/s downstream and 28,800 bit/s upstream, with LAPM and

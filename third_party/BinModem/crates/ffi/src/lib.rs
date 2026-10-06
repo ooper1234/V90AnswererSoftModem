@@ -38,10 +38,111 @@ pub const BM_RETRAINING: c_int = 5; /* back from data mode for a retrain */
 const ENGINE_FS: f64 = 16_000.0;
 const LINE_FS: f64 = 8_000.0;
 
+// HDLC evidence is meaningful once LAPM owns the line, including before
+// SABME/UA succeeds. Detection patterns and transparent async data are not
+// CRC-framed and must never trigger this recovery.
+fn monitor_receive_framing(physical_data: bool, phase: EcPhase, connected: bool) -> bool {
+    connected || (physical_data && phase == EcPhase::Protocol)
+}
+
 #[cfg(test)]
 mod error_control_clock_tests {
     use super::*;
 
+    #[test]
+    fn initial_lapm_failure_is_monitored_only_after_physical_training() {
+        use ec::frame::{Frame, Kind, DLCI_DATA};
+        use ec::hdlc::Encoder;
+        let mut answer = EcStack::new(EcRole::Answerer, EcParams::default())
+            .declared_lapm().without_detection();
+        for _ in 0..200 {
+            for _ in 0..1200 { answer.next_bit(); }
+            answer.tick(50);
+        }
+        assert_eq!(answer.phase(), EcPhase::Protocol);
+        // Reproduce the initial-call evidence: CRC-damaged frames reach the
+        // stack, but no SABME/UA exchange has established LAPM yet.
+        for _ in 0..3 {
+            let mut wire = Encoder::new(answer.fcs());
+            wire.frame(&Frame::Rr { nr: 0, pf: true }
+                .encode(DLCI_DATA, EcRole::Originator, Kind::Command));
+            let mut bits: Vec<bool> = std::iter::from_fn(|| wire.next_bit()).collect();
+            bits[12] = !bits[12];
+            for bit in bits { answer.feed_bit(bit); }
+        }
+        assert!(!answer.is_connected());
+        assert_eq!(answer.valid_frames(), 0);
+        assert!(answer.damaged_frames() >= 3);
+        assert!(monitor_receive_framing(true, answer.phase(), answer.is_connected()),
+            "a failed initial SABME/UA exchange needs receive recovery too");
+        assert!(!monitor_receive_framing(false, EcPhase::Protocol, false));
+        for phase in [EcPhase::Detecting, EcPhase::Negotiating, EcPhase::Transparent] {
+            assert!(!monitor_receive_framing(true, phase, false));
+        }
+    }
+
+    #[test]
+    fn compressed_ppp_start_waits_for_peer_data_or_bounded_timeout() {
+        let mut end = Answerer::new(true, true, false, None,
+            std::ptr::null_mut(), None, std::ptr::null_mut());
+        let params = ec::v42bis::Params { n2: 512, n7: 32 };
+        let mut answer = EcStack::new(EcRole::Answerer, EcParams::default())
+            .declared_lapm().with_compression(params);
+        let mut caller = EcStack::new(EcRole::Originator, EcParams::default())
+            .declared_lapm().with_compression(params);
+        caller.connect();
+        for i in 0..100000 {
+            let a = answer.next_bit(); let c = caller.next_bit();
+            caller.feed_bit(a); answer.feed_bit(c);
+            if i % 160 == 0 { caller.tick(16); answer.tick(16); }
+            if caller.is_connected() && answer.is_connected() { break; }
+        }
+        assert!(answer.is_connected());
+        end.physical_connected = true; end.ec = Some(answer);
+        end.update_connected_status(); assert_eq!(end.status, BM_RUNNING);
+        end.samples = 15999; end.update_connected_status();
+        assert_eq!(end.status, BM_RUNNING);
+        end.samples = 16000; end.update_connected_status();
+        assert_eq!(end.status, BM_CONNECTED);
+        end.samples = 0; end.ec_ready_at = None;
+        caller.send(&[13]);
+        for _ in 0..10000 {
+            let a = end.ec.as_mut().unwrap().next_bit(); let c = caller.next_bit();
+            caller.feed_bit(a); end.ec.as_mut().unwrap().feed_bit(c);
+        }
+        end.update_connected_status(); assert_eq!(end.status, BM_CONNECTED);
+    }
+    #[test]
+    fn valid_supervisory_acknowledgements_keep_receive_framing_healthy() {
+        use ec::frame::{Frame, Kind, DLCI_DATA};
+        use ec::hdlc::Encoder;
+        let mut answer = EcStack::new(EcRole::Answerer, EcParams::default()).declared_lapm();
+        let mut caller = EcStack::new(EcRole::Originator, EcParams::default()).declared_lapm();
+        caller.connect();
+        for i in 0..100000 {
+            let a=answer.next_bit(); let c=caller.next_bit();
+            caller.feed_bit(a); answer.feed_bit(c);
+            if i%160==0 { caller.tick(16); answer.tick(16); }
+            if caller.is_connected() && answer.is_connected() { break; }
+        }
+        assert!(answer.is_connected());
+        let mut end=Answerer::new(true,true,false,None,std::ptr::null_mut(),None,std::ptr::null_mut());
+        end.stage=Stage::Done;
+        end.ec=Some(answer);
+        bm_service(&mut end);
+        let information=end.ec.as_ref().unwrap().valid_information_frames();
+        for seconds in 1..=10 {
+            let before=end.ec.as_ref().unwrap().valid_frames();
+            let mut wire=Encoder::new(end.ec.as_ref().unwrap().fcs());
+            wire.frame(&Frame::Rr{nr:0,pf:false}.encode(DLCI_DATA,EcRole::Originator,Kind::Command));
+            while let Some(bit)=wire.next_bit() { end.ec.as_mut().unwrap().feed_bit(bit); }
+            assert!(end.ec.as_ref().unwrap().valid_frames()>before);
+            assert_eq!(end.ec.as_ref().unwrap().valid_information_frames(),information);
+            end.samples=seconds*8000;
+            bm_service(&mut end);
+            assert_eq!(end.framing_since,end.samples,"an intact acknowledgement proves framing, even without an I frame");
+        }
+    }
     #[test]
     fn detection_timeout_uses_the_active_sample_rate() {
         for rate in [LINE_FS as u32, ENGINE_FS as u32] {
@@ -215,41 +316,24 @@ fn recorded_next() -> Option<f64> {
     Some(f64::from(s) / 32768.0)
 }
 
-const ECHO_RING: usize = 8192; /* transmit history, just over a second */
+const ECHO_RING: usize = 16384; /* includes high-latency provider reflections */
 const ECHO_LAG_LO: usize = 640; /* search from 80 ms ... */
-const ECHO_LAG_HI: usize = 3072; /* ... to 384 ms */
-const V34_ECHO_LAG_HI: usize = 6000; /* V.34 carrier routes: up to 750 ms */
+const ECHO_LAG_HI: usize = 7680; /* V.90 provider echo: up to 960 ms */
+const V34_ECHO_LAG_HI: usize = 8000; /* V.34 carrier routes: up to one second */
 const ECHO_WINDOW: usize = 1024; /* lock/adapt gate on 128 ms of input */
 const ECHO_PEAK_MIN: f64 = 0.3; /* correlation needed to lock a delay */
 const ECHO_QUIET_DB: f64 = -30.0; /* input loudness the far end must be under */
 const ECHO_MU: f64 = 0.5;
 /* How far apart the lags of the TX-correlation projection are, in samples. */
 const AB_LAG_STEP: usize = 8;
-/* The data-mode tracker.
- *
- * The DIL filter is fitted over the DIL, which is narrowband start-up
- * signalling, and data mode is wideband in both directions. The reflection is
- * at the same delay the whole time -- measured across 2.56 s of data mode in
- * eight overlapping windows, the peak lag was 1319, 1319, 1321, 1319, 1319,
- * 1321, 1321, 1321 -- and a fit to the data mode's own samples reaches 23.6 dB
- * of ERLE_tx where the DIL fit reaches 13.1. So the path is not moving and does
- * not need chasing: it needs fitting once more, in the right window.
- *
- * 12288 samples is 1.5 s, a 24-sample-per-tap fit and one and a half times the
- * whole 512-tap reach of the filter's delay window. The first version used three
- * and a half seconds, which left the logged data-mode window -- 2.56 s of it,
- * opening at data-mode entry -- almost entirely filled by the filter the tracker
- * exists to replace, and the measurement could not see the tracker at all.
- */
-const TRACK_RING: usize = 12_288;
-/* How much of it a fit uses, and how much is held back from the fit to judge it
- * on. The held-back part is the *older* half, so that a fit over the newest
- * samples needs no shift to be expressed in the filter's own frame, and is still
- * out of sample: nothing that fitted the filter has seen it. */
-const TRACK_FIT: usize = 8_192;
-const TRACK_HOLD: usize = 4_096;
-/* How often to try. A second, which is a whole call's worth of rate symbols
- * between attempts and a sixteenth of the ring between refits. */
+/* The data-mode tracker refits against wideband traffic, then accepts a
+ * replacement only after an independent held-back comparison. Both windows
+ * include enough history for the longest provider echo. At 7680 samples of
+ * delay these leave over 4096 judging samples and 8192 fitting samples. */
+const TRACK_FIT: usize = 16_384;
+const TRACK_HOLD: usize = 12_288;
+const TRACK_RING: usize = TRACK_FIT + TRACK_HOLD;
+/* Try every half second; the asynchronous fit does not block line samples. */
 const TRACK_PERIOD: usize = 4_096;
 /* How much better a candidate has to be, on the held-back samples, before it
  * replaces what is in the filter. Half a decibel is noise on a window this
@@ -284,7 +368,7 @@ const DATA_LOG_SKIP: u64 = 16_384;
  * the measured ERLE_tx swung from 15.7 dB to -4.6 dB between calls that had the
  * same estimator and the same path. Half a second at 8 kHz.
  */
-const AB_WINDOW: usize = 4096;
+const AB_WINDOW: usize = 12288;
 /* The ridge on the normal equations, as a fraction of the reference's own
    energy. Swept, not guessed: over the DIL's whole spectral range anything
    from zero to 1e-4 moves the recovered gain by under a tenth, and 1e-3 by a
@@ -867,7 +951,7 @@ impl Echo {
         self.lag_hi = V34_ECHO_LAG_HI;
     }
 
-    /// VoIP playout can remove or insert 10/20 ms of audio. A shifted copy
+    /// VoIP playout can remove or insert 10–40 ms of audio. A shifted copy
     /// of the already identified echo prediction must improve BOTH halves
     /// of an independent window, with approximately unchanged gain.
     fn delay_shift(window: &[(f64, f64)]) -> isize {
@@ -986,8 +1070,47 @@ impl Echo {
     /// `delay - taps / 2 + k` ago, so the whole 512-tap window spans delays
     /// `delay - 256 ..= delay + 255`. Every lag the estimate needs is in that
     /// range, and nothing is needed outside it.
+    fn training_delay(reference: &[f64], line: &[f64], hi: usize) -> Option<usize> {
+        let n = reference.len().min(line.len());
+        // Compare every candidate on the same rows, with no startup padding.
+        let first = hi;
+        if n < first + 1024 { return None; }
+        let score = |lag: usize| {
+            let (mut xy, mut xx, mut yy) = (0.0, 0.0, 0.0);
+            for i in first..n {
+                let x = reference[i-lag];
+                let y = line[i];
+                xy += x*y; xx += x*x; yy += y*y;
+            }
+            xy.abs() / (xx*yy).max(1e-30).sqrt()
+        };
+        let mut best = ECHO_LAG_LO;
+        let mut peak = 0.0;
+        for lag in (ECHO_LAG_LO..hi).step_by(4) {
+            let value = score(lag);
+            if value > peak { best = lag; peak = value; }
+        }
+        for lag in best.saturating_sub(4).max(ECHO_LAG_LO)..(best+5).min(hi) {
+            let value = score(lag);
+            if value > peak { best = lag; peak = value; }
+        }
+        (peak >= ECHO_PEAK_MIN).then_some(best)
+    }
+
     fn ls_solve(&mut self) {
         let taps = self.w.len();
+        // ANSam/phase-2 tones have many equally good periodic delay locks.
+        // In V.34, establish the geometry again from the broadband PP/TRN
+        // window before fitting taps; otherwise a held tone alias can put the
+        // real reflection entirely outside the filter (2048 vs 3720 samples
+        // in the captured 300-ms RTT test).
+        if self.lag_hi == V34_ECHO_LAG_HI {
+            if let Some(ls) = self.ls.as_ref().filter(|ls| !ls.solved && ls.samples >= 16 * taps) {
+                if let Some(delay) = Self::training_delay(&ls.buf_r, &ls.buf_x, self.lag_hi) {
+                    self.shift_to(delay);
+                }
+            }
+        }
         let Some(ls) = self.ls.as_mut() else { return };
         // Keep enough observations for a stable fit during the far end's
         // silence. The aligned Gram matrix below removes the old delay/window
@@ -1201,6 +1324,7 @@ impl Echo {
         // beat. Its own prediction is not in the window, so it is formed from
         // the same reference with the same frame the fit uses.
         let now = Self::residual_measured(self.w.as_slice(), d0, self.delay, hold, ref_hold);
+        if !now.is_finite() || now <= 0.0 { return; }
         let Some(cand) = Self::solve_path(ref_fit, fit, d0, taps) else {
             eprintln!("  echo: track: the normal equations would not factor; the filter is left alone");
             return;
@@ -1410,6 +1534,9 @@ impl Echo {
     /// the gradient in particular has been descending on them, so a comparison
     /// there flatters it.
     fn select_echo_candidate(p_none: f64, p_grad: f64, p_ls: f64, v34: bool) -> &'static str {
+        if !p_none.is_finite() || p_none <= 0.0 || !p_grad.is_finite() || !p_ls.is_finite() {
+            return "neither";
+        }
         let margin = 10f64.powf(-0.5 / 10.0);
         if p_grad.min(p_ls) > p_none * margin {
             "neither"
@@ -1857,12 +1984,15 @@ pub struct Answerer {
     async_tx: AsyncBits,
     lapm_declared: bool,
     physical_connected: bool,
+    ec_ready_at: Option<u64>,
     ec_samples: u32,
     ec_frames_logged: u32,
     framing_good: u64,
     framing_bad: u64,
     framing_since: u64,
-    framing_information_at: u64,
+    framing_valid_at: u64,
+    framing_rate_recovery: bool,
+    ack_rate_recovery: bool,
     link_retrain_after: u64,
     link_data_active: bool,
     ec_health_last: u64,
@@ -1941,7 +2071,7 @@ impl Answerer {
             want_v34,
             want_v90,
             v90_in_data: false,
-            echo_track_data: std::env::var("V90_ECHO_TRACKING").is_ok_and(|v| v == "1"),
+            echo_track_data: std::env::var("V90_ECHO_TRACKING").map_or(true, |v| v != "0"),
             up: Resampler::new(LINE_FS, ENGINE_FS),
             down: Resampler::new(ENGINE_FS, LINE_FS),
             stage: Stage::V8(Box::new(v8m)),
@@ -1981,12 +2111,15 @@ impl Answerer {
             async_tx: AsyncBits::new(8),
             lapm_declared: false,
             physical_connected: false,
+            ec_ready_at: None,
             ec_samples: 0,
             ec_frames_logged: 0,
             framing_good: 0,
             framing_bad: 0,
             framing_since: 0,
-            framing_information_at: 0,
+            framing_valid_at: 0,
+            framing_rate_recovery: false,
+            ack_rate_recovery: false,
             link_retrain_after: 0,
             link_data_active: false,
             ec_health_last: u64::MAX,
@@ -2039,8 +2172,17 @@ fn start_error_control(&mut self) {
             return;
         }
         self.status = match self.ec.as_ref() {
-            Some(ec) if ec.phase() == EcPhase::Transparent || ec.is_connected() => BM_CONNECTED,
-            Some(_) => BM_RUNNING,
+            Some(ec) if ec.phase() == EcPhase::Transparent => BM_CONNECTED,
+            Some(ec) if ec.is_connected() => {
+                let ready = *self.ec_ready_at.get_or_insert(self.samples);
+                if ec.compression_name().is_none() || ec.valid_information_frames() > 0
+                    || self.samples.saturating_sub(ready) >= 2 * 8000 {
+                    BM_CONNECTED
+                } else {
+                    BM_RUNNING
+                }
+            },
+            Some(_) => { self.ec_ready_at = None; BM_RUNNING },
             None => BM_CONNECTED,
         };
     }
@@ -2057,6 +2199,14 @@ fn start_error_control(&mut self) {
         }
     }
 
+
+    fn request_physical_retrain(&mut self) -> bool {
+        match &mut self.stage {
+            Stage::V34(m) if matches!(m.status(), v34::startup::Status::Connected { .. }) => m.retrain(),
+            Stage::V90(m) if matches!(m.status(), v90::startup::Status::Connected { .. }) => m.retrain(),
+            _ => false,
+        }
+    }
 
     fn tick_error_control(&mut self, sample_rate: u32) {
         if let Some(ec) = self.ec.as_mut() {
@@ -2233,13 +2383,10 @@ fn start_error_control(&mut self) {
                 for note in m.take_notes() {
                     eprintln!("[{at:8.3}s] BinModem V.90: {note}");
                 }
-                // 9.3.1.6: the far modem is silent through the DIL, and that is
-                // the only window in the call where the line carries this end's
-                // own transmission and nothing else. The echo filter may only
-                // learn the path there, and it cannot tell: a line loud with our
-                // own reflection is loud in every window, so the silence has to
-                // be passed to it.
-                self.echo.far_silent = m.far_end_silent() && (m.is_v90() || v34_echo_identify());
+                // Collect the transmitted DIL even when detecting the peer's
+                // first S-bar is late. The FIR fit excludes delay/tap warm-up
+                // rows and is judged against independent post-DIL samples.
+                self.echo.far_silent = m.echo_training_window() && (m.is_v90() || v34_echo_identify());
                 // V.90 retrains in place, so C is handed no status for one
                 // failing: the reason goes to the transcript here or nowhere.
                 if let Some(why) = m.last_failure()
@@ -2911,10 +3058,16 @@ pub extern "C" fn bm_service(a: *mut Answerer) {
             eprintln!("BinModem V.32 rate RX {signal:04x} phase={}", modem.phase());
         }
     }
-    // Keep V.32 line buffering below LAPM response/detection timers.
-    // 8192 bits can delay a 4800-bit/s response by 1.7 seconds.
+    // Keep analogue line buffering near 50 ms, below LAPM response timers.
+    // V.34's former 8192 bits also delayed acknowledgements by 380 ms at
+    // 21600 bit/s, on top of the measured network round trip. The mapping
+    // frame reserve in pending_bits() remains in addition to this watermark.
     let tx_watermark = if matches!(a.stage, Stage::V32(_)) {
         (a.rate_tx.max(4800) as usize / 20).clamp(256, 1024)
+    } else if matches!(a.stage, Stage::V34(_))
+        || matches!(&a.stage, Stage::V90(m) if !m.is_v90())
+    {
+        (a.rate_tx.max(2400) as usize / 20).clamp(256, 2048)
     } else { TX_WATERMARK };
     let (accepts, mut pending) = match &a.stage {
         Stage::V32(m) => (matches!(m.status(), v32::startup::Status::Connected(_)), m.pending_bits()),
@@ -2941,7 +3094,7 @@ pub extern "C" fn bm_service(a: *mut Answerer) {
                     eprintln!("EC-WINDOW {:.3} {} {} [{}]",a.samples as f64/8000.0,if frame.outbound {"TX"} else {"RX"},if frame.intact {"ok"} else {"BAD"},hex);
                 }
                 if a.ec_frames_logged < 64 {
-                    let hex = frame.body.iter().take(32)
+                    let hex = frame.body.iter().take(1024)
                         .map(|b| format!("{b:02x}"))
                         .collect::<Vec<_>>().join(" ");
                     eprintln!("BinModem V.42 frame {} {} [{}]",
@@ -2977,7 +3130,7 @@ pub extern "C" fn bm_service(a: *mut Answerer) {
         }
     }
 
-    let physical_data=matches!(&a.stage,Stage::V90(m) if m.is_v90() && matches!(m.status(),v90::startup::Status::Connected{..}));
+    let physical_data=a.v34_carrier_up() || matches!(&a.stage,Stage::V90(m) if m.is_v90() && matches!(m.status(),v90::startup::Status::Connected{..}));
     if physical_data != a.link_data_active {
         a.link_data_active=physical_data;
         if physical_data {
@@ -2985,36 +3138,54 @@ pub extern "C" fn bm_service(a: *mut Answerer) {
             // it could not send data. Start receive evidence afresh and give
             // LAPM a short opportunity to resume before considering a retry.
             if let Some(ec)=a.ec.as_ref() {
-                a.framing_good=ec.valid_information_frames();
+                a.framing_good=ec.valid_frames();
                 a.framing_bad=ec.damaged_frames();
             }
             a.framing_since=a.samples;
-            a.framing_information_at=a.samples;
+            a.framing_valid_at=a.samples;
             a.link_retrain_after=a.link_retrain_after.max(a.samples.saturating_add(5*8000));
         }
     }
 
     // Carrier/timing lock alone cannot detect a whole-symbol frame-clock jump.
-    // Require multiple CRC failures AND two seconds without an intact I frame;
-    // isolated corrupt packets and an idle, quiet link must not trigger this.
+    // Require multiple CRC failures AND two seconds without any intact frame;
+    // intact supervisory acknowledgements also prove the receive frame clock.
+    // Application stalls are handled separately by the LAPM ACK watchdog.
     if let Some(ec) = a.ec.as_ref() {
-        let good = ec.valid_information_frames();
+        let good = ec.valid_frames();
         let bad = ec.damaged_frames();
-        if !ec.is_connected() || good != a.framing_good {
+        if !monitor_receive_framing(physical_data, ec.phase(), ec.is_connected())
+            || good != a.framing_good {
+            if good != a.framing_good {
+                a.framing_rate_recovery = false;
+            }
             a.framing_good = good;
             a.framing_bad = bad;
             a.framing_since = a.samples;
-            a.framing_information_at = a.samples;
+            a.framing_valid_at = a.samples;
         } else if bad.saturating_sub(a.framing_bad) >= 3
             && a.samples.saturating_sub(a.framing_since) >= 2 * 8000
         {
             if let Stage::V90(m) = &mut a.stage {
-                if a.samples.saturating_sub(a.framing_information_at) >= 8 * 8000
+                if a.samples.saturating_sub(a.framing_valid_at) >= 8 * 8000
                     && a.samples >= a.link_retrain_after && m.is_v90()
-                    && matches!(m.status(), v90::startup::Status::Connected { .. }) && m.retrain()
+                    && matches!(m.status(), v90::startup::Status::Connected { .. })
                 {
-                    eprintln!("BinModem V.90: no intact LAPM data frame for 8s despite repeated CRC recovery: full physical retrain");
-                    a.link_retrain_after = a.samples.saturating_add(40 * 8000);
+                    // A frame-clock slip can leave the equalizer and carrier
+                    // healthy. Refresh framing through the shorter rate
+                    // handshake before discarding that trained physical path.
+                    // If no intact frame follows, the next attempt is a full
+                    // retrain. LAPM and compression state survive both paths.
+                    if !a.framing_rate_recovery
+                        && m.renegotiate((a.rate_rx.max(4800) / 2400) as u8)
+                    {
+                        a.framing_rate_recovery = true;
+                        eprintln!("BinModem V.90: invalid LAPM framing: same-rate renegotiation");
+                        a.link_retrain_after = a.samples.saturating_add(20 * 8000);
+                    } else if m.retrain() {
+                        eprintln!("BinModem V.90: no intact LAPM frame for 8s despite repeated CRC recovery: full physical retrain");
+                        a.link_retrain_after = a.samples.saturating_add(40 * 8000);
+                    }
                 } else {
                     m.recover_upstream_framing();
                 }
@@ -3027,14 +3198,26 @@ pub extern "C" fn bm_service(a: *mut Answerer) {
     // Intact upstream frames do not prove the caller can decode downstream.
     // Give LAPM retries time, then restore the physical link before PPP's
     // keepalive deadline. Keep its frames and compression dictionaries.
+    if physical_data && a.ec.as_ref().is_some_and(|ec|
+        ec.stalled_transmit_ms().is_none_or(|ms| ms < 5000))
+    {
+        a.ack_rate_recovery = false;
+    }
     if a.samples >= a.link_retrain_after
         && a.ec.as_ref().is_some_and(|ec| ec.stalled_transmit_ms().is_some_and(|ms| ms >= 20_000))
     {
-        if let Stage::V90(m) = &mut a.stage {
-            if m.is_v90() && matches!(m.status(), v90::startup::Status::Connected { .. }) && m.retrain() {
-                eprintln!("BinModem V.90: downstream LAPM acknowledgements stalled for 20s: full physical retrain, preserving LAPM");
-                a.link_retrain_after = a.samples.saturating_add(40 * 8000);
-            }
+        let renegotiated = !a.ack_rate_recovery
+            && match &mut a.stage {
+                Stage::V90(m) if m.is_v90() => m.renegotiate((a.rate_rx.max(4800) / 2400) as u8),
+                _ => false,
+            };
+        if renegotiated {
+            a.ack_rate_recovery = true;
+            eprintln!("BinModem V.90: downstream LAPM acknowledgements stalled for 20s: same-rate renegotiation, preserving LAPM");
+            a.link_retrain_after = a.samples.saturating_add(20 * 8000);
+        } else if a.request_physical_retrain() {
+            eprintln!("BinModem: downstream LAPM acknowledgements stalled for 20s: full physical retrain, preserving LAPM");
+            a.link_retrain_after = a.samples.saturating_add(40 * 8000);
         }
     }
 
@@ -3323,7 +3506,7 @@ mod ls_tests {
 
     #[test]
     fn live_filter_applies_the_identified_sample_alignment() {
-        let count = 16384;
+        let count = 2 * ECHO_RING;
         let delay = 1320;
         let gain = -0.106;
         let mut e = recover(&[(delay, gain)], delay, 0.0, count);
@@ -3547,6 +3730,35 @@ mod ls_tests {
             "a rejected echo fit still modifies final-training samples");
     }
 
+    #[test]
+    fn echo_comparison_rejects_an_unmeasured_path() {
+        assert_eq!(Echo::select_echo_candidate(0.0, 0.0, 0.0, false), "neither");
+        assert_eq!(Echo::select_echo_candidate(f64::NAN, 1.0, 1.0, false), "neither");
+    }
+
+    #[test]
+    fn echo_comparison_measures_a_5800_sample_path() {
+        let delay = 5800;
+        let taps = 512;
+        let mut seed = 0x1234_5678u32;
+        let reference: Vec<f64> = (0..AB_WINDOW).map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed as f64 / u32::MAX as f64 - 0.5) * 0.2
+        }).collect();
+        let window: Vec<_> = (0..AB_WINDOW).map(|i| {
+            (if i >= delay { 0.2 * reference[i-delay] } else { 0.0 }, reference[i])
+        }).collect();
+        let rx: Vec<_> = window.iter().map(|p| p.0).collect();
+        let mut correct = vec![0.0; taps];
+        correct[taps/2] = 0.2;
+        let residual = Echo::apply_filter(&correct, delay, &window);
+        let before = Echo::tx_correlated(&rx, &reference, delay, taps);
+        let after = Echo::tx_correlated(&residual, &reference, delay, taps);
+        assert!(before > 0.0);
+        assert_eq!(Echo::select_echo_candidate(before, before, after, false), "LS");
+        assert_eq!(Echo::tx_correlated(&rx[..4096], &reference[..4096], delay, taps), 0.0);
+    }
+
     fn rebuild() -> Vec<(f64, f64)> {
         let delay = 1320usize;
         let n = AB_WINDOW;
@@ -3584,7 +3796,7 @@ mod ls_tests {
     fn the_judging_window_covers_every_lag_the_filter_reaches() {
         let taps = 512usize;
         // The longest delay the search will ever report, from the lock's range.
-        let worst = ECHO_LAG_HI;
+        let worst = ECHO_LAG_HI.max(V34_ECHO_LAG_HI);
         let needed = worst + taps / 2 + 256;
         assert!(
             AB_WINDOW >= needed,
@@ -3852,6 +4064,11 @@ mod ls_tests {
     }
 
     #[test]
+    fn v90_dil_identification_covers_the_recorded_provider_echo() {
+        identification_at(5800, 0.1, 5800);
+    }
+
+    #[test]
     fn v34_echo_range_is_enabled_on_v90_fallback() {
         let mut end = Answerer::new(true, true, true, None, std::ptr::null_mut(), None, std::ptr::null_mut());
         assert_eq!(end.echo.lag_hi, ECHO_LAG_HI);
@@ -3919,6 +4136,7 @@ mod ls_tests {
             end.start_v34();
             let echo = &mut end.echo;
             let mut old_echo = Echo::new();
+            old_echo.lag_hi = 3072; // Previous V.90 range, retained as the control.
             let (reference, _) = reference_with_spread(16000, 20.0);
             let mut before = 0.0f64;
             let mut after = 0.0f64;
@@ -3951,6 +4169,25 @@ mod ls_tests {
     /// was an improvement. Here the incumbent has to lose by a decibel on
     /// held-back samples or the candidate is thrown away, so the tracker can
     /// only ever go forwards. That is the whole of its safety.
+    #[test]
+    fn the_tracker_can_measure_and_update_a_725_ms_provider_path() {
+        let delay = 5800;
+        let n = TRACK_RING + TRACK_PERIOD * 2;
+        let (reference, _) = reference_with_spread(n, 2.0);
+        let mut echo = Echo::new();
+        echo.delay = delay;
+        echo.w.fill(0.0);
+        echo.set_tracking(true);
+        for i in 0..n {
+            let line = if i >= delay { -0.1 * reference[i - delay] } else { 0.0 };
+            echo.track_feed(line, reference[i]);
+            if (i + 1) % TRACK_PERIOD == 0 { wait_for_tracking(&mut echo); }
+        }
+        wait_for_tracking(&mut echo);
+        assert!(echo.track.taken > 0, "delayed path was never measured or updated");
+        assert!(echo.track.held_now.is_finite());
+        assert!(echo.w[echo.w.len()/2].abs() > 0.05);
+    }
     #[test]
     fn the_tracker_takes_a_better_path_and_refuses_a_worse_one() {
         let taps = 512usize;
@@ -4113,6 +4350,29 @@ mod ls_tests {
             assert_eq!(echo.delay,expected,"solved={solved}, far_silent={far_silent}");
             assert_eq!(echo.w,weights,"timing recovery must preserve trained coefficients");
         }
+    }
+
+    #[test]
+    fn v34_broadband_training_resolves_an_earlier_tone_delay_alias() {
+        let n = 10000;
+        let delay = 3720;
+        let (reference, _) = reference_with_spread(n, 2.0);
+        let mut line = vec![0.0; n];
+        for i in delay..n {
+            line[i] = 0.15 * reference[i-delay];
+        }
+        assert_eq!(Echo::training_delay(&reference, &line, V34_ECHO_LAG_HI), Some(delay));
+        assert_eq!(Echo::training_delay(&reference, &vec![0.0; n], V34_ECHO_LAG_HI), None);
+    }
+
+    #[test]
+    fn v34_broadband_training_covers_the_provider_echo_delay() {
+        let n = 10000;
+        let delay = 7400;
+        let (reference, _) = reference_with_spread(n, 2.0);
+        let mut line = vec![0.0; n];
+        for i in delay..n { line[i] = 0.15 * reference[i-delay]; }
+        assert_eq!(Echo::training_delay(&reference, &line, V34_ECHO_LAG_HI), Some(delay));
     }
 
     fn wait_for_tracking(echo: &mut Echo) {

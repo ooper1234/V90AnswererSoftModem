@@ -135,6 +135,8 @@ fn the_v90_path_replayed_over_a_capture() {
     assert!(!end.is_null());
     let from = (at * fs) as usize;
     let mut last = String::new();
+    let service_samples = std::env::var("V90_SERVICE_SAMPLES").ok()
+        .and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(160);
     for frame in from..end_frame {
         // Channel 0 is the first of each pair: the line as it arrived.
         //
@@ -142,9 +144,10 @@ fn the_v90_path_replayed_over_a_capture() {
         // hands the receiver's recovered bits to put_bit, so a replay that
         // only steps the engine never sees a single decoded bit and cannot
         // tell a working data path from a locked receiver decoding noise. The
-        // C calls it once per audio chunk; calling it per sample drains the
-        // same queues more often and changes nothing else.
-        bm_service(end);
+        // C calls it once per audio chunk; matching its 160-sample cadence drains the
+        // same queues at the same audio boundaries. V90_SERVICE_SAMPLES can
+        // compare other service cadences explicitly.
+        if (frame - from) % service_samples == 0 { bm_service(end); }
         bm_step(end, samples[frame * 2] as c_int);
         let now = text(bm_phase(end));
         if now != last {

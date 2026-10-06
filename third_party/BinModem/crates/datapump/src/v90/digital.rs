@@ -174,6 +174,19 @@ pub struct Settings {
     pub habits: Habits,
 }
 
+/// Advertise only supported PCM data rates up to an optional path ceiling.
+/// This constrains the peer's choice during training, not the encoded data
+/// after negotiation. Invalid limits leave the normal capability mask intact.
+fn downstream_rates(maximum: Option<u32>) -> u32 {
+    let Some(maximum) = maximum.filter(|v| (28_000..=56_000).contains(v)) else {
+        return Jd::ALL_RATES;
+    };
+    (1..=super::sequences::DOWNSTREAM_RATES as u8).fold(0, |mask, drn| {
+        if super::sequences::data_rate(drn).is_some_and(|bps| bps <= maximum) {
+            mask | (1 << (drn - 1))
+        } else { mask }
+    })
+}
 impl Settings {
     /// From INFO1d as this end sent it and the analogue modem's V.90 INFO1a.
     pub fn new(law: Law, info1d: &Info1c, asked: &Info1aPcm, round_trip: f64, wide: bool) -> Self {
@@ -186,7 +199,7 @@ impl Settings {
             round_trip,
             // Every rate, CP on four points, and the one look-ahead a digital
             // modem must have (5.4.5.5: "ld of 0 and 1 are mandatory").
-            jd: Jd { rates: Jd::ALL_RATES, sixteen_in_training: false, sixteen_in_renegotiation: false, lookahead: 1 },
+            jd: Jd { rates: downstream_rates(std::env::var("V90_MAX_DOWNSTREAM_BPS").ok().and_then(|v| v.parse().ok())), sixteen_in_training: false, sixteen_in_renegotiation: false, lookahead: 1 },
             wide,
             habits: Habits::default(),
         }
@@ -857,6 +870,10 @@ pub struct Modem {
     far_e: bool,
     decoder: Option<UpstreamDecoder>,
     acquirer: Option<UpstreamAcquirer>,
+    /// One deadline spans repeated receive-only searches. They emit no bits,
+    /// so the LAPM CRC counter cannot time out a failed search for us.
+    acquisition_since: Option<u64>,
+    acquisition_rate_recovery: bool,
     blind_acquisition_started: bool,
     b1_left: usize,
     /// How many equalised points `V90_DATA_POINTS` has taken this call.
@@ -950,6 +967,8 @@ impl Modem {
             far_e: false,
             decoder: None,
             acquirer: None,
+            acquisition_since: None,
+            acquisition_rate_recovery: false,
             blind_acquisition_started: false,
             b1_left: 0,
         cp_kept: None,
@@ -1127,6 +1146,14 @@ impl Modem {
         self.stage == Stage::AwaitSecondReversal && self.source.out == Out::Dil
     }
 
+    /// Collect the full transmitted DIL, including its delayed response to Jd'.
+    /// Waiting for the first detected reversal lost almost the entire window
+    /// in provider captures. The FIR fit discards its delay/tap warm-up rows;
+    /// selection is still checked on independent post-DIL samples.
+    pub fn echo_training_window(&self) -> bool {
+        matches!(self.stage, Stage::AwaitFirstReversal | Stage::AwaitSecondReversal)
+            && self.source.out == Out::Dil
+    }
     fn cp_tally(&self) -> String {
         let (seen, taken) = self.cps.tally();
         format!("CP sequences: {seen} begun, {taken} parsed, loudest arrival {:.4}", self.far_peak)
@@ -1381,6 +1408,7 @@ impl Modem {
         // A continuous loss of receive lock cannot deliver PPP data. Give
         // brief disturbances time to settle, then use the existing full
         // retrain path rather than leaving the call connected but unreadable.
+        self.check_acquisition_deadline();
         if held_loss(&mut self.data_lost_since, self.now,
             self.stage == Stage::Data && self.rx.is_lost())
             && !self.wants_retrain
@@ -1852,6 +1880,7 @@ impl Modem {
                             self.say("upstream data framing acquired from the superframe pattern");
                             self.decoder = Some(*decoder);
                             self.acquirer = None;
+                            self.acquisition_since = None;
                             self.data_slips = self.rx.slips();
                             self.stage = Stage::Data;
                             self.far_e = true;
@@ -2102,6 +2131,11 @@ impl Modem {
         let receive_only = self.stage == Stage::Data
             && self.source.out == Out::Data
             && self.in_data_mode();
+        if receive_only {
+            self.acquisition_since.get_or_insert(self.now);
+        } else {
+            self.acquisition_since = None;
+        }
         let acquirer = UpstreamAcquirer::new(params);
         self.rx.set_grid(acquirer.grid_scale(), acquirer.extent());
         self.decoder = None;
@@ -2109,6 +2143,28 @@ impl Modem {
         self.b1_left = 0;
         if !receive_only {
             self.status = Status::Running;
+        }
+    }
+
+    fn check_acquisition_deadline(&mut self) {
+        if self.stage == Stage::Data && self.in_data_mode()
+            && self.acquisition_since.is_some_and(|at| self.now.saturating_sub(at) >= 8 * FS as u64)
+            && !self.wants_retrain
+        {
+            // One shorter framing handshake per trained physical path.
+            // Renegotiation already has its own E deadline, so an unwilling
+            // or undecodable peer still falls back to full retraining.
+            if !self.acquisition_rate_recovery {
+                self.acquisition_rate_recovery = true;
+                let rate = (self.upstream_rate / 2400).clamp(2, 14) as u8;
+                if self.renegotiate(rate) {
+                    self.say("upstream frame acquisition timed out: same-rate renegotiation, retaining LAPM above");
+                    return;
+                }
+            }
+            self.retrain_why = Some("upstream frame acquisition did not recover within eight seconds");
+            self.say("upstream frame acquisition timed out: full retrain, retaining LAPM above");
+            self.wants_retrain = true;
         }
     }
 
@@ -2121,6 +2177,7 @@ impl Modem {
         self.say(format!("E heard: B1d going out at {} bit/s, waiting for B1", self.upstream_rate));
         self.ed_tries = ED_TRIES;
         self.acquirer = None;
+        self.acquisition_since = None;
         let decoder = UpstreamDecoder::new(params);
         // What the slicer's grid is, in the numbers that decide it. Every
         // measurement so far has said the receiver is decoding noise, and a
@@ -2239,6 +2296,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn downstream_ceiling_is_negotiated_in_jd_without_disabling_v90() {
+        let jd = Jd { rates: downstream_rates(Some(40_000)), ..Jd::default() };
+        for drn in 1..=22 {
+            assert_eq!(jd.enables(drn), super::super::sequences::data_rate(drn).unwrap() <= 40_000);
+        }
+        assert_eq!(Jd::from_bits(&jd.to_bits()), Some(jd));
+        assert_eq!(downstream_rates(None), Jd::ALL_RATES);
+        assert_eq!(downstream_rates(Some(56_000)), Jd::ALL_RATES);
+        assert_eq!(downstream_rates(Some(0)), Jd::ALL_RATES);
+        assert_eq!(downstream_rates(Some(28_000)), 1);
+        assert_eq!(downstream_rates(Some(39_999)), downstream_rates(Some(38_666)));
+    }
+    #[test]
+    fn echo_collection_covers_dil_before_a_delayed_first_reversal() {
+        use crate::v34::info::{Info1aPcm, Info1c, SymbolRate};
+        let asked = Info1aPcm { md_length:0, uinfo:79, upstream:SymbolRate::S3200, frequency_offset:None };
+        let mut m = Modem::new(Settings::new(Law::Mu, &Info1c::default(), &asked, 0.56, true));
+        m.stage = Stage::AwaitFirstReversal;
+        m.source.start(Out::JdPrime);
+        assert!(!m.echo_training_window());
+        m.source.start(Out::Dil);
+        assert!(m.echo_training_window(), "late reversal must not discard transmitted DIL history");
+        assert!(!m.far_end_silent(), "collection is not a claim of immediate peer silence");
+        m.stage = Stage::AwaitSecondReversal;
+        assert!(m.echo_training_window());
+        m.stage = Stage::Phase4Cpt;
+        assert!(!m.echo_training_window(), "CP samples must not enter the DIL fit");
+    }
+    #[test]
     fn long_profile_starts_jd_inside_4000ms() {
         let mut source=Source::new(Law::Mu,79,Jd::default(),Habits::LIVE_SERVER.trn1d);
         source.start(Out::Trn1d);
@@ -2292,6 +2378,47 @@ mod tests {
             (Some("invalid"), Code::States16)] {
             assert_eq!(upstream_code(requested_upstream_trellis(setting)), expected);
         }
+    }
+
+    #[test]
+    fn repeated_receive_searches_cannot_extend_the_recovery_deadline() {
+        use crate::v34::info::{Info1aPcm, Info1c, SymbolRate};
+        let asked = Info1aPcm { md_length:0, uinfo:79, upstream:SymbolRate::S3200, frequency_offset:None };
+        let mut m = Modem::new(Settings::new(Law::Mu, &Info1c::default(), &asked, 0.7, true));
+        m.cp = Some(Cp { data_mode:true, drn:1, upstream_rates:0x1fff, ..Cp::default() });
+        m.source.mp = Some(Mp { answer_to_call:10, rates:Mp::rates_up_to(10), ..Mp::default() });
+        let mask=(1u128<<88)-1;
+        m.cpt=Some(Cp {drn:1,constellations:vec![mask],..Cp::default()});
+        m.cp.as_mut().unwrap().constellations=vec![mask];
+        m.source.data_mode=Mapping::from_cp(m.cp.as_ref().unwrap());
+        m.source.start(Out::Data);
+        m.stage = Stage::Data;
+        m.status = Status::Connected { downstream:28000, upstream:24000 };
+        m.now = FS as u64;
+        m.start_upstream_acquisition();
+        assert!(m.acquirer.is_some());
+        assert!(matches!(m.status, Status::Connected {..}), "receive-only recovery must keep feeding downstream");
+        for seconds in 2..9 {
+            m.now = seconds * FS as u64;
+            // A failed acquisition restarts the search without producing new
+            // LAPM frames or increasing the CRC counter, as in the capture.
+            m.start_upstream_acquisition();
+            m.check_acquisition_deadline();
+            assert!(!m.wants_retrain);
+        }
+        m.now = 9 * FS as u64;
+        m.check_acquisition_deadline();
+        assert!(m.renegotiating, "a healthy-looking PLL must not strand PPP in an endless framing search");
+        assert!(!m.take_retrain(), "try the shorter framing handshake before full retraining");
+        assert!(m.deadline.is_some(), "rate recovery must retain a bounded E deadline");
+        // If the newly framed data fails too, do not loop rate recovery.
+        m.renegotiating=false;
+        m.status=Status::Connected {downstream:28000,upstream:24000};
+        m.stage=Stage::Data;
+        m.acquisition_since=Some(m.now);
+        m.now+=8*FS as u64;
+        m.check_acquisition_deadline();
+        assert!(m.take_retrain(), "an unsuccessful shorter recovery must fall back to full retraining");
     }
 
     #[test]

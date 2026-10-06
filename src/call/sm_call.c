@@ -1206,6 +1206,9 @@ out:
         bbs_session_destroy((bbs_session_t *) c->bbs);
         c->bbs = NULL;
     }
+    /* Explicit AudioSocket termination also releases receivers that do not
+       promptly notice TCP EOF. Best effort: the peer may already be gone. */
+    (void) sm_ast_write(&c->as, SM_AS_KIND_HANGUP, NULL, 0);
     stop_pppd(c);
     close(socket_fd);
     sm_log_message(&c->log, SM_LOG_FLOW, "<<< sm_call_run EXIT rc=%d", rc);

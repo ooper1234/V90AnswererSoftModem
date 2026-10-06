@@ -1,17 +1,23 @@
 """Loopback-only HTTP/CONNECT proxy reachable through SLiRP's 10.0.2.2."""
 import http.server
 import json
+import os
 import pathlib
 import select
 import socket
 import struct
 import urllib.parse
 
-config = json.loads((pathlib.Path('/opt/v90/wifi/wifi-uplink.json')).read_text())
-
 def connect_wifi(host, port):
     if port not in (80, 443):
         raise ValueError('Only website ports 80 and 443 are allowed')
+    if os.environ.get('V90_UPLINK', 'wifi') == 'vpngate':
+        # The VPN namespace owns the default route and the egress kill switch.
+        # Going through the Wi-Fi relay here bypasses that default entirely.
+        stream = socket.create_connection((host, port), 15)
+        stream.settimeout(None)
+        return stream
+    config = json.loads(pathlib.Path('/opt/v90/wifi/wifi-uplink.json').read_text())
     error = None
     for _, _, _, _, address in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
         stream = socket.create_connection((config['relay_ip'], 9081), 15)
@@ -79,4 +85,5 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         except (OSError, ValueError) as error:
             self.send_error(502, str(error))
 
-http.server.ThreadingHTTPServer(('0.0.0.0', 9082), Proxy).serve_forever()
+if __name__ == '__main__':
+    http.server.ThreadingHTTPServer(('0.0.0.0', 9082), Proxy).serve_forever()

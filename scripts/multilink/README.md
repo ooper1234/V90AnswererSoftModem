@@ -1,15 +1,52 @@
 # Shared Multilink PPP backend
 
+## Optional VPN Gate uplink
+
+Set `V90_UPLINK=vpngate` and `V90_PPP_DNS=1.1.1.1` on the dedicated
+PPP container, and mount a sanitized OpenVPN profile at
+`/opt/v90/vpn/vpngate.ovpn` read-only. The VPN launcher currently pins the
+tested relay `27.130.93.85:1233/udp`; changing relays requires updating
+the profile, transport firewall allowance and expected exit verification.
+Keep profile keys private and outside version control.
+
+The VPN-enabled image needs OpenVPN, CA certificates, curl and iptables.
+Only the PPP container's default route changes. Its Docker control network
+remains reachable; Asterisk and host management keep their own routes.
+PPP IPv4 forwarding is NATed into `tun0`, and the HTTP/HTTPS proxy also uses
+the VPN. DNS is offered as `1.1.1.1`, replacing SLiRP's DNS address for VPN
+sessions. Reconnect existing clients to receive the new DNS setting.
+
+The launcher verifies an HTTPS exit check before accepting PPP sessions.
+When VPN routing fails, firewall rules reject home-internet fallback. A VPN
+process/interface failure stops the backend, allowing its container restart
+policy to retry; this may disconnect callers. A volunteer relay's continued
+availability and unchanged IP are not guaranteed.
+
+In VPN mode, up to four active physical modem transports reserve distinct
+private addresses from `10.0.2.15` through `10.0.2.18`. Independent callers
+therefore do not overwrite each other's PPP routes. Multilink members join
+their existing bundle and retain its IPCP address, including when the first
+physical member drops. All callers still share the VPN's public exit IP.
+Do not switch backends while calls are active. Back up
+the compose file and backend scripts before changing a live installation.
+
 This backend terminates each modem's PPP link with native Linux `pppd` and
 joins links with the same peer endpoint discriminator into one kernel PPP
 bundle. RFC 1990 packet fragmentation, ordering and link removal are handled
 by Linux, rather than implemented inside the modem signal processor.
 
-The current local configuration serves one Windows computer at a time:
+The Wi-Fi/SLiRP configuration serves one Windows computer at a time:
 server `10.0.2.2`, client `10.0.2.15`, DNS `10.0.2.3`. It also accepts a
 single-link caller. Two unrelated computers require separate address pools
 and authentication configuration, which this local test configuration does
-not provide.
+not provide. The VPN address pool separates private routes, but does not
+add caller authentication or separate public IPs.
+
+Each physical transport permits at most two PPP process retries for the
+specific Linux `Couldn't attach to PPP unit ... Invalid argument` failure.
+The modem transport stays open during those retries. Ordinary hangups and
+other daemon failures do not automatically restart PPP. LCP and IPCP retry
+intervals are ten seconds to accommodate modem latency.
 
 ## Prerequisites
 

@@ -293,12 +293,10 @@ impl Encoder {
             // character arrives to say what to extend it by.
             self.owed = Some(current);
         }
-        if self.writer.pending() > 0 {
-            // A partial octet would otherwise sit unsent; FLUSH lets the
-            // decoder discard the padding that follows.
-            self.write(FLUSH, out);
-            self.writer.align(out);
-        }
+        // FLUSH signals completion to the peer even when there is no partial
+        // octet. Byte alignment alone is not a substitute for that command.
+        self.write(FLUSH, out);
+        self.writer.align(out);
     }
 
     /// Re-initialise and tell the peer (V.42bis 7.8.3).
@@ -525,6 +523,19 @@ impl Decoder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_byte_aligned_compressed_flush_still_signals_completion() {
+        let mut encoder = Encoder::new(Params::default());
+        encoder.inner.mode = Mode::Compressed;
+        let mut wire = Vec::new();
+        for _ in 0..8 { encoder.emit(3, &mut wire); }
+        assert_eq!(encoder.writer.pending(), 0);
+        wire.clear();
+        encoder.flush(&mut wire);
+        let mut reader = BitReader::new();
+        for byte in wire { reader.push_octet(byte); }
+        assert_eq!(reader.read(9), Some(FLUSH));
+    }
     use super::*;
 
     fn round_trip(input: &[u8]) -> Vec<u8> {

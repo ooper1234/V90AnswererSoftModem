@@ -7,7 +7,11 @@ test -c /dev/ppp || mknod /dev/ppp c 108 0
 mkdir -p /dev/net
 test -c /dev/net/tun || mknod /dev/net/tun c 10 200
 mkdir -p /run/ppp
-python3 /opt/v90/multilink/uplink.py &
+if [ "${V90_UPLINK:-wifi}" = vpngate ]; then
+ python3 /opt/v90/multilink/vpn_uplink.py &
+else
+ python3 /opt/v90/multilink/uplink.py &
+fi
 uplink=$!
 cleanup() { kill "$uplink" ${server:-} ${proxy:-} 2>/dev/null || true; }
 trap cleanup EXIT TERM INT

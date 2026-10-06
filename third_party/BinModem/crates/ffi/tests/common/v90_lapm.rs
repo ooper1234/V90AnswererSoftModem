@@ -35,6 +35,10 @@ pub fn run_fallback() {
     run_mode(true, true, true, false, false, false, false, false, false);
 }
 
+pub fn run_fallback_outage() {
+    run_mode(true, true, true, false, true, false, false, false, true);
+}
+
 pub fn run_fallback_echo() {
     run_mode(true, true, true, true, false, false, false, false, false);
 }
@@ -83,7 +87,9 @@ fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool, ec
     let ptr = &mut dte as *mut Dte as *mut c_void;
     let end = bm_create_v90(1, Some(get_bit), ptr, Some(put_bit), ptr);
     assert!(!end.is_null());
-    let mut net = Network::new(Law::Mu, 16_000.0).with_delay(0.015, 16_000.0)
+    let one_way = std::env::var("LAPM_TEST_DELAY_MS").ok()
+        .and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0;
+    let mut net = Network::new(Law::Mu, 16_000.0).with_delay(one_way, 16_000.0)
         .with_noise(1e-5);
     let mut noise_state = 3490u32;
     let mut far = Far::V8(v8line::Modem::new(v8line::Role::Calling,
@@ -104,11 +110,17 @@ fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool, ec
     let mut slips = 0;
     let mut retrain_requests = 0;
     let mut next_retrain = None;
-    // Receive recovery has 20 extra seconds for a full physical retrain;
-    // the earlier stalled case still fails this bounded 80-second budget.
+    let mut finished_at = None;
+    // Allow time for LAPM retransmission of the 64 KiB compressed transfer
+    // after framing recovery. The previous full-retrain path stalls even
+    // with this 120-second budget; same-rate renegotiation preserves the
+    // trained path and finishes every byte within it.
     // With reflection, the analogue peer needs its second V.90 recovery before
     // selecting V.34. Keep time for that handshake and the verified payload.
-    for tick in 0..(if echo || full_retrain || rate_change || outage { 120 } else if recovery { 80 } else { 60 } * 8000) {
+    let budget = std::env::var("V90_TEST_SECONDS").ok()
+        .and_then(|s| s.parse::<usize>().ok()).map(|s| s.clamp(60, 180))
+        .unwrap_or(if echo || full_retrain || rate_change || outage || recovery { 120 } else { 60 });
+    for tick in 0..budget * 8000 {
         // Poll then service then step, matching sm_call.c. Service throughout
         // negotiation, since V.42 cannot complete without its line bits.
         if tick % 160 == 0 {
@@ -213,9 +225,12 @@ fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool, ec
                 }
             }
         }
-        if got_down.len() >= down.len() && got_up.len() >= up.len() { break; }
+        if got_down.len() >= down.len() && got_up.len() >= up.len() {
+            finished_at = Some(tick as f64 / 8000.0);
+            break;
+        }
     }
-    if outage { assert!(matches!(&far, Far::Data(m) if m.retrains() >= 1), "stalled downstream did not trigger physical recovery"); }
+    if outage { assert!(matches!(&far, Far::Data(m) if m.retrains() >= 1 || m.renegotiations() >= 1), "stalled downstream did not trigger link recovery"); }
     let connected = dte.armed;
     let lapm = bm_error_control(end);
     let compression = bm_compression(end);
@@ -242,6 +257,7 @@ fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool, ec
     }
     assert!(got_down == down, "downstream bytes: received {} of {}", got_down.len(), down.len());
     assert!(got_up == up, "upstream bytes: received {} of {}", got_up.len(), up.len());
+    eprintln!("DUPLEX-CHECK complete_at={finished_at:?} upstream={} downstream={} rate_up={upstream_rate} outage={outage}", got_up.len(), got_down.len());
     if whole_jump { assert_eq!(slips, 1); }
     if recovery && !full_retrain && !whole_jump && !rate_change && !outage { assert_eq!(slips, 2, "both playout jumps must occur during the transfer"); }
 }
