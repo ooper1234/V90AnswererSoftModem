@@ -181,6 +181,52 @@ fn a_dictionary_that_fills_starts_again_without_losing_anything() {
     assert_eq!(round_trip_with(&text, params), text);
 }
 
+/// 7.11.4: "When the history is full (C4 = N8T), the encoder shall terminate
+/// any string-matching or string-extension activity in progress". Appendix
+/// II: that condition "prevents the decoder's history from being over-run".
+///
+/// A match or extension that began just short of N8 used to run on past it,
+/// by up to N7 characters, and a real decoder with an N8R-sized history (a
+/// Conexant modem on 2026-11-08, 1024 negotiated) hung up on it with
+/// "INCOMPATIBLE PROTOCOL". Our own decoder grows its history as needed, so
+/// a plain round trip never noticed; this watches the history instead.
+#[test]
+fn the_history_never_grows_past_n8() {
+    for params in [
+        Params { n2: 256, n7: 32, n8: 512 },
+        Params { n2: 512, n7: 32, n8: 1024 },
+        Params { n2: 2048, n7: 255, n8: 6144 },
+    ] {
+        // Long repeats, so matches and extensions are long and keep landing
+        // across the end of the history; flushed in uneven chunks the way a
+        // link hands data over.
+        let mut text = Vec::new();
+        for i in 0..4000u32 {
+            text.extend_from_slice(b"GET /index.html HTTP/1.1\r\nHost: example\r\n");
+            text.extend_from_slice(format!("{}", i % 7).as_bytes());
+        }
+        let mut enc = Encoder::new(params);
+        let mut dec = Decoder::new(params);
+        let mut back = Vec::new();
+        let mut most = 0;
+        for chunk in text.chunks(97) {
+            let mut wire = Vec::new();
+            enc.encode(chunk, &mut wire);
+            enc.flush(&mut wire);
+            for b in wire {
+                dec.decode(&[b], &mut back).expect("decode failed");
+                most = most.max(dec.history_len());
+            }
+        }
+        assert_eq!(back, text, "{params:?}");
+        assert!(
+            most <= usize::from(params.n8),
+            "decoder history reached {most}, past N8 = {} ({params:?})",
+            params.n8
+        );
+    }
+}
+
 /// 7.11.2: the codeword size grows as the dictionary does, announced each
 /// time, and the far end follows without being told how far.
 #[test]
@@ -303,6 +349,56 @@ fn an_escape_in_transparent_data_is_announced_and_moves_on() {
     let mut back = Vec::new();
     dec.decode(&wire, &mut back).expect("decode failed");
     assert_eq!(back, text);
+}
+
+/// 7.14 and 7.5: the ESCAPE is set to zero only when the data compression
+/// function is initialised. ECM reinitialises the dictionary (6.5.2) and
+/// leaves the ESCAPE where transparent mode left it, so a second spell of
+/// transparent mode goes on from the value the first one reached.
+///
+/// Built by hand from the Recommendation, not by our encoder, because both
+/// halves once reset the ESCAPE on ECM and agreed with each other: a real
+/// modem's second transparent spell (live call 17, 2026-11-08) then read as
+/// an ESCAPE followed by a reserved command, and the link was dropped.
+#[test]
+fn the_escape_survives_a_return_to_compressed_mode() {
+    let wire = [
+        0x01, // compressed: prefix "1", ETM (0) in six bits, aligned
+        0x00, 0x01, // transparent: ESCAPE (0) + EID -> data 0x00, ESCAPE now 51
+        0x41, // 'A'
+        0x33, 0x00, // ESCAPE (51) + ECM -> compressed, dictionary restarted
+        0x01, // ETM again
+        0x00, // ESCAPE is 51, so 0x00 is plain data
+        0x33, 0x01, // ESCAPE (51) + EID -> data 0x33, ESCAPE now 102
+        0x42, // 'B'
+    ];
+    let mut dec = Decoder::new(Params::default());
+    let mut out = Vec::new();
+    dec.decode(&wire, &mut out).expect("a spec-conformant stream was refused");
+    assert_eq!(out, vec![0x00, 0x41, 0x00, 0x33, 0x42]);
+    assert_eq!(dec.mode(), Mode::Transparent);
+}
+
+/// The encoder's half of the same rule: after ECM, its ESCAPE carries on.
+#[test]
+fn the_encoder_keeps_its_escape_across_ecm() {
+    let mut enc = Encoder::new(Params::default());
+    let mut wire = Vec::new();
+    enc.enter_transparent_now(&mut wire);
+    enc.encode(&[0x00], &mut wire); // the ESCAPE (0): announced, then 51
+    enc.flush(&mut wire);
+    enc.enter_compressed(&mut wire);
+    assert!(wire.ends_with(&[0x33, 0x00]), "ECM is sent with the current ESCAPE: {wire:02x?}");
+    enc.enter_transparent_now(&mut wire);
+    let from = wire.len();
+    enc.encode(&[0x00, 0x33], &mut wire);
+    enc.flush(&mut wire);
+    assert_eq!(&wire[from..], &[0x00, 0x33, 0x01], "0x00 is data now, 0x33 is the ESCAPE");
+
+    let mut dec = Decoder::new(Params::default());
+    let mut back = Vec::new();
+    dec.decode(&wire, &mut back).expect("decode failed");
+    assert_eq!(back, vec![0x00, 0x00, 0x33]);
 }
 
 /// 7.15: a codeword above C1 is a procedural error rather than something to

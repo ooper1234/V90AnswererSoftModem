@@ -969,6 +969,8 @@ pub struct Startup {
     /// detector conditioned a 4800 connection to receive at 9600 and the data
     /// never arrived.
     heard_end: bool,
+    /// Calling-side receive readiness is measured from the peer's E, not ours.
+    heard_end_at: Option<u64>,
     /// Held until the next symbol boundary, where the machine can act on them.
     pending_carrier_reversal: bool,
     pending_sideband_reversal: bool,
@@ -1015,6 +1017,7 @@ impl Startup {
             carrier_quiet: 0,
             sideband_quiet: 0,
             heard_end: false,
+            heard_end_at: None,
             rates: RateDetector::new(),
             countdown: sps,
             sps,
@@ -1200,7 +1203,13 @@ impl Startup {
     pub fn training_symbols(&self) -> u64 {
         let near = (ECHO_SPAN_MS * super::BAUD / 1000.0) as u64;
         if self.round_trip > near {
+            // Half of TRN is used for echo search. Leave 640 symbols of
+            // returned TRN after the expected delay: preceding handshake
+            // tones otherwise dilute its correlation.
+            let packet_slack = (0.064 * super::BAUD).ceil() as u64;
             timing::SEGMENT_TRN_LONG
+                .max(2 * (self.round_trip + packet_slack) + timing::SEGMENT_TRN)
+                .min(8192)
         } else {
             timing::SEGMENT_TRN
         }
@@ -1339,6 +1348,7 @@ impl Startup {
             && let Some(e) = self.pending_sequence.filter(|&s| is_end_signal(s))
         {
             self.heard_end = true;
+            self.heard_end_at = Some(self.total);
             rx.set_data_rate(offered_rate(e));
             rx.set_coding(agreed_coding(e, self.offer, offered_rate(e)));
         }
@@ -1941,12 +1951,14 @@ impl Startup {
                 if let Some(s) = sequence.filter(|&s| is_end_signal(s) && self.agreed == 0) {
                     self.agreed = offered_rate(s);
                 }
-                if self.symbols >= timing::SETTLE {
+                let receive_ready = self.role == Role::Answering
+                    || self.heard_end_at.is_some_and(|at|
+                        self.total.saturating_sub(at) >= timing::SETTLE);
+                if self.symbols >= timing::SETTLE && receive_ready {
                     let rate = if self.agreed == 0 { 4800 } else { self.agreed };
-                    // The far end changed rate as it finished its own E, which
-                    // was at least a hundred and twenty symbols ago whichever
-                    // end this is. If that E went unheard, this is the last
-                    // chance to end up demodulating what is actually arriving.
+                    // The caller waits 128 symbols after the received E
+                    // (V.32 5.4.1; V.32bis 6.1). The answerer waits after
+                    // transmitting its E, which already follows the peer's E.
                     rx.set_data_rate(rate);
                     rx.set_coding(self.coding);
                     self.state = State::Connected(rate);
@@ -2129,6 +2141,7 @@ impl Startup {
         self.carrier_peak = 0.0;
         self.trained = false;
         self.heard_end = false;
+        self.heard_end_at = None;
         // The start-up is conducted in the four states whatever was agreed
         // (5.4), so both ends go back to two bits a symbol before either of
         // them sends anything.
@@ -2240,6 +2253,7 @@ pub struct Modem {
     /// difference between a canceller that works on a long line and one that
     /// does not, and there is no way to see it from outside.
     reflection: Option<Reflection>,
+    echo_round_trip: u64,
     fs: f64,
     /// The return loss as training ended, which is the last moment it means
     /// anything: with both ends talking the meter compares everything heard
@@ -2340,6 +2354,7 @@ impl Modem {
             searched: 0,
             search_for: 0,
             reflection: None,
+            echo_round_trip: 0,
             fs,
             trained_loss: 0.0,
             was_training: false,
@@ -2360,6 +2375,19 @@ impl Modem {
         // chance to find out where the line puts it back as well as what shape
         // it comes back in. The first half goes on finding it and the second
         // on cancelling it.
+        if self.startup.training_echo() && !self.was_training && self.reflection.is_some() {
+            let movement = self.startup.round_trip().abs_diff(self.echo_round_trip)
+                as f64 * self.fs / super::BAUD;
+            // A packet-delay jump is outside the narrow far filter's reach.
+            // Preserve a stable filter, but relearn a substantially moved path
+            // during the peer's guaranteed silence rather than its data.
+            if movement > (4 * self.far_taps()) as f64 {
+                self.echo = EchoCanceller::new(
+                    (ECHO_SPAN_MS * self.fs / 1000.0) as usize, ECHO_STEP);
+                self.reflection = None;
+                self.finder = None;
+            }
+        }
         if self.startup.training_echo() && !self.was_training && self.reflection.is_none() {
             // On a retrain, keep the far taps already tracking the hybrid.
             // Searching the residual beyond their span finds the echo's weak
@@ -2502,6 +2530,7 @@ impl Modem {
         let offset = found.delay.saturating_sub(taps / 2).max(self.echo.span());
         self.echo.watch_far_echo(offset, taps);
         self.reflection = Some(found);
+        self.echo_round_trip = self.startup.round_trip();
     }
 
     fn far_taps(&self) -> usize {
@@ -2712,6 +2741,51 @@ mod tests {
         assert!(modem.echo_return_loss() > 15.0);
     }
     #[test]
+    fn echo_search_handles_seven_hundred_ms_round_trip() {
+        let mut modem = Modem::new(Role::Answering,
+            rate_signal(Rates::between(4800, 14400)), 16000.0);
+        modem.startup.state = State::SendTrn;
+        modem.startup.round_trip = 1680;
+        modem.tx.set_signal(Signal::Trn);
+        let delay = 11600;
+        let mut previous = Transmitter::new(Mode::Answer, 16000.0);
+        previous.set_signal(Signal::AlternateAC);
+        let mut echo: std::collections::VecDeque<f64> =
+            (0..delay).map(|_| previous.next_sample() * 0.22).collect();
+        for _ in 0..40000 {
+            let sent = modem.step(echo.pop_front().unwrap());
+            echo.push_back(sent * 0.22);
+        }
+        let reflection = modem.reflection().expect("long-delay reflection missed");
+        assert!(reflection.delay.abs_diff(delay) < 64);
+        assert!(modem.echo_return_loss() > 15.0,
+            "insufficient cancellation: {} dB", modem.echo_return_loss());
+    }
+    #[test]
+    fn retraining_relocates_a_network_echo_that_moved_forty_ms() {
+        let mut modem = Modem::new(Role::Answering,
+            rate_signal(Rates::between(4800, 14400)), 16000.0);
+        for (round_trip, delay) in [(1759, 11822usize), (1856, 12462)] {
+            modem.startup.state = State::SendTrn;
+            modem.startup.symbols = 0;
+            modem.startup.trained = false;
+            modem.startup.round_trip = round_trip;
+            modem.tx.set_signal(Signal::Trn);
+            let mut previous = Transmitter::new(Mode::Answer, 16000.0);
+            previous.set_signal(Signal::AlternateAC);
+            let mut echo: std::collections::VecDeque<f64> =
+                (0..delay).map(|_| previous.next_sample() * 0.22).collect();
+            for _ in 0..50000 {
+                let sent = modem.step(echo.pop_front().unwrap());
+                echo.push_back(sent * 0.22);
+            }
+            let found = modem.reflection().expect("missing retrained reflection");
+            assert!(found.delay.abs_diff(delay) < 64,
+                "kept old echo at {} after path moved to {delay}", found.delay);
+            assert!(modem.echo_return_loss() > 15.0);
+        }
+    }
+    #[test]
     fn training_rate_signal_respects_the_peer_selection() {
         for role in [Role::Calling, Role::Answering] {
             for bis in [false, true] {
@@ -2743,6 +2817,27 @@ mod tests {
             listener.feed(tx.next_sample());
         }
         listener.classify()
+    }
+
+    #[test]
+    fn caller_waits_for_peer_end_before_receive_readiness() {
+        let mut startup = Startup::new(Role::Calling, rate_signal(Rates::between(4800, 14400)), FS);
+        let (mut tx, mut rx) = endpoints(Role::Calling, FS);
+        startup.state = State::Settling;
+        startup.agreed = 9600;
+        startup.symbols = timing::SETTLE;
+        startup.total = 1000;
+        startup.advance(false, false, None, &mut tx, &mut rx);
+        assert_eq!(startup.state, State::Settling);
+        startup.heard_end_at = Some(1000);
+        startup.total = 1000 + timing::SETTLE - 1;
+        startup.advance(false, false, None, &mut tx, &mut rx);
+        assert_eq!(startup.state, State::Settling);
+        startup.total += 1;
+        startup.advance(false, false, None, &mut tx, &mut rx);
+        assert_eq!(startup.status(), Status::Connected(9600));
+        startup.start_again(&mut tx, &mut rx);
+        assert_eq!(startup.heard_end_at, None);
     }
 
     #[test]

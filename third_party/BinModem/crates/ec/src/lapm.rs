@@ -181,6 +181,22 @@ pub enum Event {
     /// The peer re-established mid-connection, so unacknowledged data was lost
     /// (V.42 8.2.4.3: previously-transmitted I frames are discarded).
     Reset,
+    /// The SABME behind the last `Reset` was a late duplicate: the peer had
+    /// not re-established, and its acknowledgements still counted from before.
+    /// The old sequence state is back and nothing was lost, but anything above
+    /// that restarted on the `Reset` (V.42bis dictionaries) is now out of step.
+    ResetUndone,
+}
+
+/// What a SABME received while connected reset, kept until the peer shows
+/// whether it re-established too.
+#[derive(Debug, Clone)]
+struct PreReset {
+    vs: u8,
+    va: u8,
+    vr: u8,
+    unacked: VecDeque<(u8, Vec<u8>)>,
+    held: BTreeMap<u8, Vec<u8>>,
 }
 
 /// One LAPM entity.
@@ -214,6 +230,11 @@ pub struct Lapm {
     reject_sent: bool,
     /// Whether the single-selective-reject procedure was agreed (8.4.5.1).
     srej: bool,
+    /// The most I frames the far end may have outstanding towards this end,
+    /// as the XID exchange settled it (V.42 9.2.4): what an out-of-sequence
+    /// frame is held against. Its own, not [`Params::k`], which is this end's
+    /// sending window.
+    receive_k: u8,
     /// I frames that arrived ahead of V(R), held until the gap closes.
     ///
     /// The whole of what selective reject buys. Go-back-N throws these away
@@ -237,7 +258,58 @@ pub struct Lapm {
     /// restarts: what is wanted is how long the acknowledgement really took,
     /// across however many attempts it took to get one.
     awaiting_ms: Option<u32>,
+    /// T401 expired at least once during the wait `awaiting_ms` measures, so
+    /// that wait is the round trip plus however long the frames were lost,
+    /// not the round trip. A poll's answer resets `retries` before the data
+    /// is acknowledged, so the count cannot say this on its own: 2026-11-17,
+    /// a 20 s outage was taken as a 20 s round trip and T401 set to its
+    /// ceiling for the rest of the call.
+    timed_out: bool,
+    /// T401 expiries since an answer that came within the timer, which set
+    /// how much longer than the line's value the next wait is. Kept apart
+    /// from `retries`, which a re-establishment and a poll's answer reset,
+    /// because only a clean answer says the line's value is enough again
+    /// (Karn's rule): a far end further away than the timer allows for
+    /// answers every attempt late, and a link re-established in a long
+    /// outage would otherwise spend its attempts at the shortest wait.
+    backoff: u32,
+    /// Sequence state from before a SABME that arrived while connected.
+    ///
+    /// A SABME the peer retransmitted because our UA was slow to reach it can
+    /// arrive after the connection is up and carrying data. Its peer is
+    /// connected and has not reset; resetting on it anyway leaves the two ends
+    /// numbering frames differently, and every frame after is discarded as a
+    /// duplicate. 8.2.4.3 is followed -- the reset happens -- but if the
+    /// peer's next N(R) or N(S) only makes sense against the old numbering,
+    /// the old numbering is put back.
+    pre_reset: Option<PreReset>,
+    /// Whether, since the link was last established, the peer has
+    /// acknowledged a frame or sent one in sequence. Until it has, a SABME on
+    /// the connected link is the peer still opening it (see `on_sabme`).
+    exchanged: bool,
+    /// Time since the peer last showed that it hears us: an acknowledgement
+    /// that moved V(A), a response with F set (the answer to a poll of ours),
+    /// a reject, or a UA.
+    ///
+    /// Its own polls and its own data say nothing about that. A real far end
+    /// that had stopped reading our signal after a rate renegotiation went
+    /// on polling every 0.7 s for over 40 s; with nothing of ours outstanding
+    /// no timer was running here, so nothing noticed.
+    unheard_ms: u32,
+    /// Time since this end last sent a probe (see [`PROBE_AFTER_MS`]).
+    since_probe_ms: u32,
+    /// Milliseconds since the link was made, for the trace.
+    clock_ms: u64,
+    /// A diagnostic record of frames handed out and N(R)s heard, while set.
+    pub trace: Option<Vec<String>>,
 }
+
+/// How long a connected link may go without evidence the peer hears us before
+/// it is asked, with an RR command and P set, which it must answer (8.4.2.1).
+///
+/// Long enough that a link carrying our data never needs one, short enough
+/// that a deaf peer shows within a few seconds.
+const PROBE_AFTER_MS: u32 = 3000;
 
 /// The most T401 will be allowed to grow to.
 ///
@@ -262,12 +334,21 @@ impl Lapm {
             peer_busy: false,
             reject_sent: false,
             srej: false,
+            receive_k: DEFAULT_K,
             held: BTreeMap::new(),
             ack_pending: false,
             timer_recovery: false,
             timer: None,
             retries: 0,
             awaiting_ms: None,
+            timed_out: false,
+            backoff: 0,
+            unheard_ms: 0,
+            since_probe_ms: 0,
+            clock_ms: 0,
+            trace: None,
+            pre_reset: None,
+            exchanged: false,
         }
     }
 
@@ -292,6 +373,23 @@ impl Lapm {
     /// Optional, and only after both ends have said so in XID: 8.4.5.1 has an
     /// end that did not agree treat an SREJ as an unrecognized control field,
     /// which under 8.5.5 ends the connection.
+    /// The longest information field and the most outstanding I frames
+    /// this end sends, as the XID exchange settled them (V.42 9.2.3, 9.2.4).
+    pub fn set_send_limits(&mut self, n401: usize, k: u8) {
+        self.params.n401 = n401.max(1);
+        self.params.k = k.clamp(1, MODULUS - 1);
+    }
+
+    /// The far end's window towards this end, as the XID exchange settled it.
+    pub fn set_receive_window(&mut self, k: u8) {
+        self.receive_k = k.clamp(1, MODULUS - 1);
+    }
+
+    /// What [`Self::set_send_limits`] last set, or the defaults.
+    pub fn send_limits(&self) -> (usize, u8) {
+        (self.params.n401, self.params.k)
+    }
+
     pub fn set_selective_reject(&mut self, on: bool) {
         self.srej = on;
     }
@@ -317,10 +415,41 @@ impl Lapm {
     }
 
 
+    /// How long, while connected, since the peer last showed it hears us.
+    ///
+    /// An idle link is probed every [`PROBE_AFTER_MS`], so a peer that hears
+    /// us keeps this below about that plus a round trip.
+    pub fn unheard_ms(&self) -> Option<u32> {
+        self.is_connected().then_some(self.unheard_ms)
+    }
+
+    fn heard(&mut self) {
+        self.unheard_ms = 0;
+    }
+
+    /// Poll the peer now, as the idle probe does: an RR command with P set,
+    /// which it must answer (8.4.2.1). Nothing while not connected.
+    pub fn probe(&mut self) {
+        if self.state == State::Connected {
+            self.send(Frame::Rr { nr: self.vr, pf: true }, Kind::Command);
+            self.ack_pending = false;
+            self.since_probe_ms = 0;
+        }
+    }
+
     /// Frames to hand to the HDLC layer.
     pub fn poll_transmit(&mut self) -> Option<(Frame, Kind)> {
         self.pump();
-        self.out.pop_front()
+        let next = self.out.pop_front();
+        if let (Some(t), Some((f, _))) = (self.trace.as_mut(), next.as_ref()) {
+            let what = match f {
+                Frame::I { ns, nr, poll, info } => format!("I ns {ns} nr {nr} p {poll} len {}", info.len()),
+                Frame::Rr { nr, pf } => format!("RR nr {nr} pf {pf}"),
+                other => format!("{other:?}").chars().take(40).collect(),
+            };
+            t.push(format!("{} out {what} va {} vs {}", self.clock_ms, self.va, self.vs));
+        }
+        next
     }
 
     /// Events for the control function.
@@ -371,6 +500,12 @@ impl Lapm {
         self.pending.iter().map(Vec::len).sum()
     }
 
+    /// Nothing waiting to be framed and nothing sent unacknowledged: the far
+    /// end has every octet handed down so far.
+    pub fn all_acknowledged(&self) -> bool {
+        self.pending.is_empty() && self.unacked.is_empty()
+    }
+
     /// Compression reinitialization invalidates already encoded octets that
     /// have not reached the serializer, just as it invalidates unacked data.
     pub fn discard_pending(&mut self) {
@@ -386,8 +521,21 @@ impl Lapm {
 
     /// Advance timers by `dt_ms` (V.42 8.3.2.2, 8.7.3, 8.4.8).
     pub fn tick(&mut self, dt_ms: u32) {
+        self.clock_ms += u64::from(dt_ms);
         if let Some(waited) = self.awaiting_ms {
             self.awaiting_ms = Some(waited.saturating_add(dt_ms));
+        }
+        if self.state == State::Connected {
+            self.unheard_ms = self.unheard_ms.saturating_add(dt_ms);
+            self.since_probe_ms = self.since_probe_ms.saturating_add(dt_ms);
+            // With T401 running, its own expiry polls; this is for the link
+            // with nothing of ours outstanding.
+            if self.timer.is_none()
+                && self.unheard_ms >= PROBE_AFTER_MS
+                && self.since_probe_ms >= PROBE_AFTER_MS
+            {
+                self.probe();
+            }
         }
         let Some(remaining) = self.timer else { return };
         if remaining > dt_ms {
@@ -395,12 +543,14 @@ impl Lapm {
             return;
         }
         self.timer = None;
-        // An expiry is the one thing that says T401 is too short for this line
-        // without saying by how much, so it grows by half and tries again.
-        // Appendix IV's sum has two terms this end cannot see -- the far end's
-        // transmit queue and its processing -- and a line it cannot see at
-        // all, so the value that works is found rather than calculated.
-        self.params.t401_ms = (self.params.t401_ms * 3 / 2).min(MAX_T401_MS);
+        self.timed_out = true;
+        self.backoff = (self.backoff + 1).min(16);
+        // An expiry is the one thing that says T401 may be too short for this
+        // line without saying by how much, so the next wait is half as long
+        // again (see `backed_off_t401`). Appendix IV's sum has two terms this
+        // end cannot see -- the far end's transmit queue and its processing --
+        // and a line it cannot see at all, so the value that works is found
+        // rather than calculated.
         self.retries += 1;
         if self.retries >= self.params.n400 {
             self.fail();
@@ -434,6 +584,15 @@ impl Lapm {
 
     /// Handle a frame from the peer.
     pub fn receive(&mut self, frame: Frame, kind: Kind) {
+        if let Some(t) = self.trace.as_mut() {
+            let what = match &frame {
+                Frame::I { ns, nr, poll, info } => format!("I ns {ns} nr {nr} p {poll} len {}", info.len()),
+                Frame::Rr { nr, pf } => format!("RR nr {nr} pf {pf} {kind:?}"),
+                Frame::Rej { nr, pf } => format!("REJ nr {nr} pf {pf}"),
+                other => format!("{other:?}").chars().take(40).collect(),
+            };
+            t.push(format!("{} in {what} va {} vs {}", self.clock_ms, self.va, self.vs));
+        }
         // V.42 8.3.2.1: "Upon receipt of an I frame or a supervisory frame,
         // the originator of the SABME command may assume that the responding
         // error-correcting entity has received and accepted the SABME command
@@ -480,9 +639,44 @@ impl Lapm {
 
     fn on_sabme(&mut self, poll: bool) {
         let was_connected = self.state == State::Connected;
+        if was_connected && !self.exchanged {
+            // Nothing has been acknowledged or received since the link came
+            // up, so the peer is still opening it: its UA was late (a long
+            // VoIP round trip outlasts its T401) and it asked again. Both ends
+            // are still at the numbering and the compression state they
+            // started from, so what this end sent is still exactly what the
+            // peer needs, under the same numbers -- and the peer, awaiting its
+            // UA, threw the first copies away. Resetting here (8.2.4.3)
+            // discards the only copy: the first data of the call, a login
+            // screen, never arrived. Answer, and send it all again instead.
+            self.out.retain(|(f, _)| !matches!(f, Frame::I { .. }));
+            self.send(Frame::Ua { final_bit: poll }, Kind::Response);
+            let vr = self.vr;
+            for (ns, info) in self.unacked.clone() {
+                self.out.push_back((Frame::I { ns, nr: vr, poll: false, info }, Kind::Command));
+            }
+            self.peer_busy = false;
+            self.reject_sent = false;
+            self.timer_recovery = false;
+            self.retries = 0;
+            if self.unacked.is_empty() {
+                self.stop_timer();
+            } else {
+                self.start_timer();
+            }
+            return;
+        }
+        let before = was_connected.then(|| PreReset {
+            vs: self.vs,
+            va: self.va,
+            vr: self.vr,
+            unacked: self.unacked.clone(),
+            held: self.held.clone(),
+        });
         // V.42 8.2.4.3: acceptance resets V(S), V(A) and V(R), and previously
         // transmitted unacknowledged I frames are discarded.
         self.reset_variables();
+        self.pre_reset = before;
         self.send(Frame::Ua { final_bit: poll }, Kind::Response);
         self.state = State::Connected;
         self.stop_timer();
@@ -532,6 +726,9 @@ impl Lapm {
     /// what the clause gives a newly connected originator, and not whatever a
     /// wider reset happens to coincide with.
     fn establish(&mut self) {
+        self.exchanged = false;
+        self.heard();
+        self.since_probe_ms = 0;
         self.stop_timer();
         self.vs = 0;
         self.va = 0;
@@ -557,14 +754,38 @@ impl Lapm {
 
     fn on_i(&mut self, ns: u8, nr: u8, poll: bool, info: Vec<u8>) {
         self.acknowledge(nr);
+        if let Some(p) = &self.pre_reset {
+            if ns != self.vr && ns == p.vr {
+                // Numbered from where the peer was before the SABME: it never
+                // reset.
+                let p = self.pre_reset.take().unwrap();
+                self.undo_reset(p);
+            } else if ns == self.vr && ns != p.vr {
+                // Numbered from 0 again: the peer did reset.
+                self.pre_reset = None;
+            }
+        }
+        // A frame numbered behind V(R) is one already taken, sent again
+        // because its acknowledgement had not arrived yet -- on a path with
+        // a second of delay a modem whose T401 is shorter than that repeats
+        // every frame. Nothing is missing, so nothing is asked for: an SREJ
+        // here would name V(R), a frame the peer has not sent yet, and a USR
+        // Sportster answers that one with the stale contents of its
+        // retransmission store. The frame is dropped and acknowledged again.
+        let ahead = ns.wrapping_sub(self.vr) % MODULUS;
+        // Behind or ahead is told by which half of the numbering it falls in,
+        // not by k: the two directions may have agreed different windows.
+        let duplicate = ahead >= MODULUS / 2;
         if ns == self.vr {
             self.deliver(info);
+        } else if duplicate {
+            self.ack_pending = true;
         } else if self.srej {
             // Out of sequence, and the frames after the missing one are worth
             // keeping: only the one that was lost has to be asked for
             // (8.2.4.8.1). Bounded by the window, so that a sequence number
             // from nowhere cannot make this grow.
-            let top = (self.vr + u8::min(self.params.k, MODULUS - 1)) % MODULUS;
+            let top = (self.vr + u8::min(self.receive_k, MODULUS - 1)) % MODULUS;
             if in_window(self.vr, ns, top) {
                 self.held.insert(ns, info);
             }
@@ -593,6 +814,7 @@ impl Lapm {
     /// of the I frame with an N(S) equal to the N(R) of the SREJ frame", and
     /// that N(R) was V(R), which is the frame being taken.
     fn deliver(&mut self, info: Vec<u8>) {
+        self.exchanged = true;
         self.vr = (self.vr + 1) % MODULUS;
         self.reject_sent = false;
         self.ack_pending = true;
@@ -609,6 +831,7 @@ impl Lapm {
 
     /// V.42 8.4.5.1: send again the one I frame the peer asked for.
     fn on_srej(&mut self, nr: u8) {
+        self.heard();
         self.peer_busy = false;
         // "The N(R) of the SREJ frame does not indicate acknowledgement of any
         // I frames" (8.2.4.8.1), so V(A) does not move -- which is the whole
@@ -625,6 +848,7 @@ impl Lapm {
     }
 
     fn on_rr(&mut self, nr: u8, pf: bool, kind: Kind) {
+        self.heard_final(pf, kind);
         self.peer_busy = false;
         self.acknowledge(nr);
         self.resolve_timer_recovery(pf, kind);
@@ -632,6 +856,7 @@ impl Lapm {
     }
 
     fn on_rnr(&mut self, nr: u8, pf: bool, kind: Kind) {
+        self.heard_final(pf, kind);
         self.acknowledge(nr);
         self.peer_busy = true;
         self.resolve_timer_recovery(pf, kind);
@@ -640,6 +865,14 @@ impl Lapm {
         // the peer's later RR can be lost, leaving pending data stuck forever.
         if self.timer.is_none() {
             self.start_timer();
+        }
+    }
+
+    /// A response with F set answers a poll of ours (8.4.2.1), so the poll
+    /// got there.
+    fn heard_final(&mut self, pf: bool, kind: Kind) {
+        if pf && kind == Kind::Response {
+            self.heard();
         }
     }
 
@@ -659,6 +892,8 @@ impl Lapm {
     }
 
     fn on_rej(&mut self, nr: u8, pf: bool, kind: Kind) {
+        // A reject is the peer reading our frames and finding one missing.
+        self.heard();
         self.peer_busy = false;
         self.acknowledge(nr);
         // Go back to N(R): everything still unacknowledged is sent again.
@@ -678,9 +913,25 @@ impl Lapm {
     /// modulo 128 (V.42 8.2.3.2.3).
     fn acknowledge(&mut self, nr: u8) {
         if !in_window(self.va, nr, self.vs) {
-            return;
+            // Outside the window. After a SABME received while connected, an
+            // N(R) that fits the numbering from before it is the peer saying
+            // it never reset.
+            match self.pre_reset.take() {
+                Some(p) if in_window(p.va, nr, p.vs) => self.undo_reset(p),
+                _ => return,
+            }
+            if !in_window(self.va, nr, self.vs) {
+                return;
+            }
+        } else if nr != self.va {
+            // It acknowledged a frame sent since the reset: the reset stands.
+            self.pre_reset = None;
         }
         let previous = self.va;
+        if nr != self.va {
+            self.exchanged = true;
+            self.heard();
+        }
         while self.va != nr {
             self.unacked.pop_front();
             self.va = (self.va + 1) % MODULUS;
@@ -692,7 +943,14 @@ impl Lapm {
         } else if self.va != previous {
             // Some of them were acknowledged and others were not, so the
             // oldest outstanding frame is a different and later one: the wait
-            // being measured is its wait, not the retired frame's.
+            // being measured is its wait, not the retired frame's. The peer
+            // answering ends the backoff too: in a bulk transfer the window is
+            // never empty, and a backoff left standing until it was would
+            // make every later loss cost the ceiling (2026-11-17).
+            self.retries = 0;
+            if !self.timed_out {
+                self.backoff = 0;
+            }
             self.awaiting_ms = None;
             self.start_timer();
         } else if self.timer.is_none() {
@@ -758,7 +1016,35 @@ impl Lapm {
         self.out.push_back((frame, kind));
     }
 
+    /// Put back the sequence state a duplicate SABME reset (see `pre_reset`).
+    ///
+    /// Frames sent since the reset went out numbered from 0 and the peer
+    /// discarded them as duplicates, so they are renumbered after the old
+    /// state and sent again.
+    fn undo_reset(&mut self, p: PreReset) {
+        let since: Vec<Vec<u8>> = self.unacked.drain(..).map(|(_, info)| info).collect();
+        // Anything still queued under the post-reset numbering is wrong too.
+        self.out.retain(|(f, _)| !matches!(f, Frame::I { .. }));
+        self.vs = p.vs;
+        self.va = p.va;
+        self.vr = p.vr;
+        self.unacked = p.unacked;
+        self.held = p.held;
+        for info in since {
+            let ns = self.vs;
+            self.unacked.push_back((ns, info.clone()));
+            self.out.push_back((Frame::I { ns, nr: self.vr, poll: false, info }, Kind::Command));
+            self.vs = (self.vs + 1) % MODULUS;
+        }
+        if self.va != self.vs {
+            self.start_timer();
+        }
+        self.events.push_back(Event::ResetUndone);
+    }
+
     fn reset_variables(&mut self) {
+        self.pre_reset = None;
+        self.exchanged = false;
         self.out.clear();
         self.vs = 0;
         self.va = 0;
@@ -769,6 +1055,8 @@ impl Lapm {
         self.reject_sent = false;
         self.ack_pending = false;
         self.timer_recovery = false;
+        self.unheard_ms = 0;
+        self.since_probe_ms = 0;
     }
 
     fn enter_disconnected(&mut self, cause: Cause) {
@@ -784,17 +1072,21 @@ impl Lapm {
     }
 
     fn start_timer(&mut self) {
-        self.timer = Some(self.params.t401_ms);
         // A retransmission is the same command still outstanding, so the wait
         // carries on being measured from when it was first asked for.
+        if self.awaiting_ms.is_none() {
+            self.timed_out = false;
+        }
+        self.timer = Some(self.backed_off_t401());
         self.awaiting_ms = self.awaiting_ms.or(Some(0));
     }
 
     fn stop_timer(&mut self) {
         self.timer = None;
         if let Some(waited) = self.awaiting_ms.take()
-            && self.retries == 0
+            && !self.timed_out
         {
+            self.backoff = 0;
             // A clean answer, so this is the round trip itself rather than the
             // round trip plus whatever a lost frame cost. Appendix IV asks for
             // at least the sum of the six terms; half again is the margin for
@@ -806,11 +1098,23 @@ impl Lapm {
 
     /// The acknowledgement timer as it now stands, in milliseconds.
     ///
-    /// It only ever rises: V.42 9.2.1 asks for a timer long enough to wait for
-    /// an acknowledgement, and a value that shrank on one fast frame would
-    /// spend the next slow one retransmitting.
+    /// The line's part only ever rises: V.42 9.2.1 asks for a timer long
+    /// enough to wait for an acknowledgement, and a value that shrank on one
+    /// fast frame would spend the next slow one retransmitting. The backoff on
+    /// top of it lasts until the peer next answers.
     pub fn t401_ms(&self) -> u32 {
-        self.params.t401_ms
+        self.backed_off_t401()
+    }
+
+    /// T401 for the next wait: the line's value, half as long again for each
+    /// expiry since the peer last answered within the timer, never past
+    /// [`MAX_T401_MS`]. The
+    /// backoff is kept apart from the line's value so that it ends when the
+    /// peer answers; folded into it, a burst of losses early in a call left
+    /// every wait after it at the ceiling (2026-11-17: 6 s, against a 0.75 s
+    /// round trip).
+    fn backed_off_t401(&self) -> u32 {
+        (0..self.backoff).fold(self.params.t401_ms, |t, _| (t * 3 / 2).min(MAX_T401_MS))
     }
 
     /// Address this entity uses when encoding.
@@ -854,6 +1158,87 @@ mod tests {
         assert_eq!(a.stalled_transmit_ms(),Some(1000));
         a.receive(Frame::Rr{nr:1,pf:false},Kind::Response);
         assert_eq!(a.stalled_transmit_ms(),None,"acknowledgement clears stall");
+    }
+
+    /// Polls from us that the peer is bound to answer: an RR command, P set.
+    fn probes(l: &mut Lapm) -> usize {
+        let mut n = 0;
+        while let Some((frame, kind)) = l.poll_transmit() {
+            if matches!(frame, Frame::Rr { pf: true, .. }) && kind == Kind::Command {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn an_idle_link_is_probed_and_a_peer_that_answers_is_heard() {
+        let (mut a, mut b) = connected(false);
+        assert_eq!(a.unheard_ms(), Some(0));
+        let mut sent = 0;
+        for _ in 0..40 {
+            a.tick(100);
+            // Everything a sends reaches b, and b's answers reach a.
+            while let Some((frame, kind)) = a.poll_transmit() {
+                if matches!(frame, Frame::Rr { pf: true, .. }) && kind == Kind::Command {
+                    sent += 1;
+                }
+                b.receive(frame, kind);
+            }
+            deliver(&mut b, &mut a);
+        }
+        assert!(sent >= 1, "an idle link was never probed");
+        assert!(a.unheard_ms().unwrap() < 3000, "the answer to the probe was not taken as being heard: {:?}", a.unheard_ms());
+    }
+
+    #[test]
+    fn a_peer_that_answers_nothing_goes_unheard() {
+        let (mut a, _b) = connected(false);
+        let mut sent = 0;
+        for _ in 0..120 {
+            a.tick(100);
+            sent += probes(&mut a);
+        }
+        assert_eq!(a.unheard_ms(), Some(12_000));
+        assert!((3..=4).contains(&sent), "probes every 3 s, got {sent} in 12 s");
+        assert!(a.is_connected(), "probing must not tear the link down");
+    }
+
+    #[test]
+    fn a_probe_on_demand_polls_at_once_and_an_answer_is_heard() {
+        let (mut a, mut b) = connected(false);
+        a.tick(1000);
+        assert_eq!(probes(&mut a), 0, "nothing due yet");
+        a.probe();
+        let (frame, kind) = a.poll_transmit().expect("probe");
+        assert!(matches!(frame, Frame::Rr { pf: true, .. }) && kind == Kind::Command, "{frame:?} {kind:?}");
+        b.receive(frame, kind);
+        deliver(&mut b, &mut a);
+        assert_eq!(a.unheard_ms(), Some(0));
+    }
+
+    #[test]
+    fn a_peers_own_polls_do_not_show_it_hears_us() {
+        let (mut a, _b) = connected(false);
+        for _ in 0..50 {
+            a.tick(100);
+            // The peer polls; a answers. Nothing says the answer arrived.
+            a.receive(Frame::Rr { nr: 0, pf: true }, Kind::Command);
+            while a.poll_transmit().is_some() {}
+        }
+        assert_eq!(a.unheard_ms(), Some(5000));
+    }
+
+    #[test]
+    fn data_the_peer_acknowledges_shows_it_hears_us() {
+        let (mut a, mut b) = connected(false);
+        for _ in 0..50 {
+            a.tick(100);
+            b.tick(100);
+            a.send_data(b"x");
+            settle(&mut a, &mut b);
+        }
+        assert!(a.unheard_ms().unwrap() <= 100, "{:?}", a.unheard_ms());
     }
 
     fn pair() -> (Lapm, Lapm) {
@@ -985,6 +1370,54 @@ mod tests {
     }
 
     #[test]
+    fn frames_after_a_gap_are_held_against_the_far_ends_window_not_ours() {
+        // V.42 9.2.4 settles each direction's window on its own: a far end
+        // sending 40 outstanding at an end whose own window is 3. The frames
+        // after the lost one are in the far end's window, so they are held
+        // and only the lost one is sent again.
+        let (mut a, mut b) = connected(true);
+        a.set_send_limits(1, 40);
+        b.set_send_limits(128, 3);
+        b.set_receive_window(40);
+        let data: Vec<u8> = (0..40u8).collect();
+        a.send_data(&data);
+        deliver_losing(&mut a, &mut b, Some(2));
+        deliver(&mut b, &mut a);
+        let again = deliver_losing(&mut a, &mut b, None);
+        settle(&mut a, &mut b);
+        assert_eq!(again, vec![2], "only the frame that was lost");
+        assert_eq!(data_from(&mut b), data);
+    }
+
+    #[test]
+    fn a_frame_sent_twice_is_dropped_without_asking_for_anything() {
+        // A peer whose T401 is shorter than the round trip repeats frames
+        // that arrived. Nothing is missing, so neither reject may be sent:
+        // it would name a frame the peer has not sent yet.
+        for srej in [false, true] {
+            let (mut a, mut b) = connected(srej);
+            a.send_data(b"a");
+            let (frame, kind) = a.poll_transmit().expect("the frame");
+            b.receive(frame.clone(), kind);
+            while b.poll_transmit().is_some() {}
+            b.receive(frame, kind);
+            let mut answers = Vec::new();
+            while let Some((f, _)) = b.poll_transmit() {
+                answers.push(f);
+            }
+            assert!(
+                answers.iter().all(|f| !matches!(f, Frame::Srej { .. } | Frame::Rej { .. })),
+                "a duplicate was answered with a reject: {answers:?}"
+            );
+            assert_eq!(data_from(&mut b), b"a", "and it is delivered once");
+            // The next frame is still taken in sequence.
+            a.send_data(b"b");
+            deliver(&mut a, &mut b);
+            assert_eq!(data_from(&mut b), b"b");
+        }
+    }
+
+    #[test]
     fn a_selective_reject_does_not_acknowledge_anything() {
         // 8.2.4.8.1: "the N(R) of the SREJ frame does not indicate
         // acknowledgement of any I frames". An end that treated it as one
@@ -1025,6 +1458,116 @@ mod tests {
         assert!(in_window(126, 1, 3));
         assert!(!in_window(126, 4, 3));
         assert_eq!(outstanding(126, 2), 4);
+    }
+
+    #[test]
+    fn duplicate_sabme_after_data_does_not_desynchronise() {
+        // Seen on a call with ~0.9 s of round-trip delay: the caller's SABME
+        // was answered, the answerer sent two I frames, and only then did the
+        // caller's retransmitted SABME arrive. Resetting on it put the
+        // answerer back at N(S) 0 while the caller, already connected,
+        // expected 2 -- and discarded everything after as duplicates.
+        let (mut caller, mut answerer) = pair();
+        caller.connect();
+        deliver(&mut caller, &mut answerer); // SABME
+        deliver(&mut answerer, &mut caller); // UA
+        assert!(caller.is_connected() && answerer.is_connected());
+
+        answerer.send_data(b"screen ");
+        answerer.send_data(b"Login: ");
+        deliver(&mut answerer, &mut caller); // I(0), I(1)
+        assert_eq!(data_from(&mut caller), b"screen Login: ");
+
+        // The late copy of the SABME.
+        answerer.receive(Frame::Sabme { poll: true }, Kind::Command);
+        deliver(&mut answerer, &mut caller); // a UA the caller has no use for
+        settle(&mut caller, &mut answerer);  // the caller's RR N(R)=2
+
+        answerer.send_data(b"cooper\r\nPassword: ");
+        settle(&mut answerer, &mut caller);
+        assert_eq!(data_from(&mut caller), b"cooper\r\nPassword: ",
+            "data after a duplicate SABME must still arrive");
+
+        // And it keeps working in both directions afterwards.
+        caller.send_data(b"test\r");
+        answerer.send_data(b"Entering PPP Session.");
+        settle(&mut answerer, &mut caller);
+        assert_eq!(data_from(&mut answerer), b"test\r");
+        assert_eq!(data_from(&mut caller), b"Entering PPP Session.");
+    }
+
+    #[test]
+    fn data_sent_between_a_duplicate_sabme_and_its_proof_is_resent() {
+        // The answerer may already have sent new frames, numbered from 0,
+        // before the caller's acknowledgement shows the reset was spurious.
+        let (mut caller, mut answerer) = pair();
+        caller.connect();
+        settle(&mut caller, &mut answerer);
+        answerer.send_data(b"one ");
+        answerer.send_data(b"two ");
+        deliver(&mut answerer, &mut caller);
+        answerer.receive(Frame::Sabme { poll: true }, Kind::Command);
+        answerer.send_data(b"three");          // goes out as N(S) 0: discarded
+        deliver(&mut answerer, &mut caller);
+        settle(&mut caller, &mut answerer);
+        assert_eq!(data_from(&mut caller), b"one two three",
+            "the frame sent under the wrong number is sent again, renumbered");
+    }
+
+    /// The 2026-11-02 V.92 calls: over a 0.9 s VoIP round trip the caller's
+    /// T401 ran out before the UA reached it, so it sent its SABME again --
+    /// after the answerer had already sent the login screen as I frame 0.
+    /// The caller, still awaiting its UA, had discarded that frame, and the
+    /// reset on the second SABME discarded the only copy: the caller polled
+    /// with RR N(R)=0 for the rest of the call and the screen never came.
+    #[test]
+    fn a_caller_still_opening_the_link_gets_what_was_sent_before_its_second_sabme() {
+        let (mut caller, mut answerer) = pair();
+        caller.connect();
+        deliver(&mut caller, &mut answerer); // SABME
+        answerer.send_data(b"Login:");
+        while answerer.poll_transmit().is_some() {} // UA and I 0: too late, not taken
+        caller.tick(Params::default().t401_ms + 1); // so the caller asks again
+        deliver(&mut caller, &mut answerer);
+        settle(&mut caller, &mut answerer);
+        assert_eq!(data_from(&mut caller), b"Login:");
+        assert!(!events(&mut answerer).contains(&Event::Reset),
+            "nothing was exchanged, so there was nothing to reset");
+    }
+
+    /// Once anything has been acknowledged the SABME is a real reset again
+    /// (8.2.4.3), whatever was outstanding.
+    #[test]
+    fn a_sabme_after_data_has_flowed_still_resets() {
+        let (mut caller, mut answerer) = pair();
+        caller.connect();
+        settle(&mut caller, &mut answerer);
+        answerer.send_data(b"one");
+        settle(&mut caller, &mut answerer);
+        events(&mut answerer);
+        answerer.receive(Frame::Sabme { poll: true }, Kind::Command);
+        assert!(events(&mut answerer).contains(&Event::Reset));
+    }
+
+    #[test]
+    fn an_undone_reset_is_reported() {
+        let (mut caller, mut answerer) = pair();
+        caller.connect();
+        settle(&mut caller, &mut answerer);
+        // Something acknowledged first: before that a SABME is the caller
+        // still opening the link and resets nothing at all.
+        answerer.send_data(b"w");
+        settle(&mut caller, &mut answerer);
+        events(&mut answerer);
+        answerer.send_data(b"x");
+        deliver(&mut answerer, &mut caller);
+        answerer.receive(Frame::Sabme { poll: true }, Kind::Command);
+        deliver(&mut answerer, &mut caller);
+        settle(&mut caller, &mut answerer);
+        let ev = events(&mut answerer);
+        assert!(ev.contains(&Event::Reset));
+        assert!(ev.contains(&Event::ResetUndone),
+            "the stack has to know, to resynchronise compression: {ev:?}");
     }
 
     #[test]
@@ -1255,6 +1798,62 @@ mod tests {
         assert_eq!(a.state(), State::AwaitingEstablishment);
         a.receive(Frame::Ua { final_bit: true }, Kind::Response);
         assert_eq!(a.state(), State::Connected);
+    }
+
+    /// An outage long enough for T401 to back off to its ceiling.
+    fn backed_off_in_an_outage() -> (Lapm, Lapm) {
+        let params = Params { t401_ms: 1170, ..Default::default() };
+        let mut a = Lapm::new(Role::Originator, DLCI_DATA, params);
+        let mut b = Lapm::new(Role::Answerer, DLCI_DATA, Params::default());
+        a.connect();
+        settle(&mut a, &mut b);
+        a.send_data(&vec![0x5a; DEFAULT_N401 * 2 * DEFAULT_K as usize]);
+        for _ in 0..5 {
+            while a.poll_transmit().is_some() {} // the line is gone
+            a.tick(a.t401_ms());
+        }
+        while a.poll_transmit().is_some() {}
+        assert!(a.is_connected());
+        assert_eq!(a.t401_ms(), MAX_T401_MS, "the backoff during the outage");
+        // The line is back; the poll the next expiry sends finds the peer.
+        a.tick(a.t401_ms());
+        (a, b)
+    }
+
+    /// 2026-11-17, a 1 MB download from the CX93001 over a 0.75 s round
+    /// trip: a few bursts of line errors early on backed T401 off to its 6 s
+    /// ceiling, where it stayed, and every lost final frame after that cost
+    /// 6 s plus the round trip -- stalls of 7.3-8.5 s and twice that, 218 B/s
+    /// over five minutes. The backoff is for the frames still unanswered;
+    /// once the peer answers, the timer is the line's again.
+    #[test]
+    fn a_backed_off_timer_comes_back_once_the_peer_answers() {
+        let (mut a, mut b) = backed_off_in_an_outage();
+        settle(&mut a, &mut b);
+        assert_eq!(a.va, a.vs, "everything got across once the line was back");
+        assert_eq!(a.t401_ms(), 1170);
+    }
+
+    /// The same in a bulk transfer, where the window is never empty and
+    /// "everything acknowledged" may not come for the rest of the call.
+    #[test]
+    fn progress_with_frames_still_outstanding_ends_the_backoff() {
+        let (mut a, mut b) = backed_off_in_an_outage();
+        deliver(&mut a, &mut b); // the poll
+        deliver(&mut b, &mut a); // its answer: everything is sent again
+        let mut across = |a: &mut Lapm, b: &mut Lapm, n: usize| {
+            for _ in 0..n {
+                let (frame, kind) = a.poll_transmit().expect("a frame to send");
+                b.receive(frame, kind);
+            }
+            deliver(b, a);
+        };
+        // The first acknowledgement answers frames that timed out, so it says
+        // nothing about the line (Karn's rule); the next one is clean.
+        across(&mut a, &mut b, 3);
+        across(&mut a, &mut b, 3);
+        assert!(a.va == 6 && a.va != a.vs, "va {} vs {}", a.va, a.vs);
+        assert_eq!(a.t401_ms(), 1170);
     }
 
     /// A measurement that arrives cleanly is used as it stands.

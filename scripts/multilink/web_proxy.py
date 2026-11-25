@@ -72,6 +72,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             self.send_error(502, str(error))
 
     def do_CONNECT(self):
+        established = False
         try:
             host, port = self.path.rsplit(':', 1)
             if int(port) != 443:
@@ -79,11 +80,16 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             with connect_wifi(host, 443) as remote:
                 self.send_response(200, 'Connection established')
                 self.end_headers()
+                established = True
                 self.wfile.flush()
                 bridge(self.connection, remote)
-            self.close_connection = True
         except (OSError, ValueError) as error:
-            self.send_error(502, str(error))
+            # After 200, these bytes belong to the TLS tunnel. An HTTP 502
+            # would corrupt that stream and cannot repair a closed socket.
+            if not established:
+                self.send_error(502, str(error))
+        finally:
+            self.close_connection = True
 
 if __name__ == '__main__':
     http.server.ThreadingHTTPServer(('0.0.0.0', 9082), Proxy).serve_forever()

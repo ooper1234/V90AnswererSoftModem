@@ -84,8 +84,11 @@ impl Side {
     /// -- 1200 Hz and tone B, whichever end dialled -- and sends INFO0d, which
     /// is longer than V.34's INFO0. Its analogue modem's INFO0a and INFO1a are
     /// V.34's lengths, and INFO1d is INFO1c.
-    fn lengths(self) -> &'static [usize] {
+    fn lengths(self, x2: bool) -> &'static [usize] {
         match self {
+            // An x2 client's marker comes from the call modem, and only an
+            // answering server offering x2 listens for it.
+            Self::Call if x2 => &[info::X2_MARKER_BITS, info::INFO0_BITS, info::INFO0D_BITS, info::INFO1C_BITS],
             Self::Call => &[info::INFO0_BITS, info::INFO0D_BITS, info::INFO1C_BITS],
             Self::Answer => &[info::INFO0_BITS, info::INFO1A_BITS],
         }
@@ -263,6 +266,10 @@ struct Branch {
 #[derive(Debug, Clone)]
 pub struct Receiver {
     side: Side,
+    hold_mode: bool,
+    short_qam: bool,
+    /// Also listening for U.S. Robotics x2's thirty-nine-bit marker.
+    x2: bool,
     nco: Nco,
     select: ComplexFir,
     matched: ComplexFir,
@@ -282,6 +289,9 @@ impl Receiver {
         let sps = fs / BAUD;
         Self {
             side,
+            hold_mode: false,
+            short_qam: false,
+            x2: false,
             nco: Nco::new(side.carrier(), fs),
             // Linear phase, for the reason V.22bis's is. The other direction
             // is 1200 Hz away and the answer modem's own guard tone 600 Hz
@@ -310,8 +320,48 @@ impl Receiver {
         self.level
     }
 
+    /// Unframed INFOMARKS: sustained binary ones on a live DPSK carrier.
+    pub fn marks(&self) -> bool {
+        self.level > 0.003 && self.branches.iter().filter(|branch|
+            branch.bits.len() >= 32 && branch.bits.iter().rev().take(32).all(|&bit| bit)
+        ).count() >= PHASES / 2
+    }
+
+    /// A V.92 modem-on-hold receiver, explicitly separate from initial
+    /// capability detection. MH is shorter than INFO0 and uses the same
+    /// carrier, so accepting both without context risks false framing.
+    pub fn hold_sequences(side: Side, fs: f64) -> Self {
+        let mut receiver = Self::new(side, fs);
+        receiver.hold_mode = true;
+        receiver
+    }
+
+    pub fn set_short_qam(&mut self,enabled:bool) {self.short_qam=enabled;}
+
+    /// The same receiver, also listening for an x2 client's marker
+    /// ([`info::X2Marker`]). Only an answering modem offering x2 asks: the
+    /// marker is a thirty-nine-bit frame no V.34 or V.90 modem sends.
+    pub fn with_x2(mut self) -> Self {
+        self.x2 = true;
+        self
+    }
+
+    pub fn feed_hold(&mut self, sample: f64) -> Option<crate::v92::HoldMessage> {
+        match self.feed_sequence(sample)? {
+            Received::Hold(message) => Some(message),
+            Received::Info(_) => None,
+        }
+    }
+
     /// Feed one line sample. Yields a sequence the moment its CRC checks.
     pub fn feed(&mut self, sample: f64) -> Option<Info> {
+        match self.feed_sequence(sample)? {
+            Received::Info(info) => Some(info),
+            Received::Hold(_) => None,
+        }
+    }
+
+    fn feed_sequence(&mut self, sample: f64) -> Option<Received> {
         let (cos, sin) = self.nco.step();
         let selected = self.select.process((sample * cos, sample * -sin));
         let magnitude = (selected.0 * selected.0 + selected.1 * selected.1).sqrt();
@@ -331,7 +381,7 @@ impl Receiver {
                 );
                 branch.next += self.sps;
                 if found.is_none() {
-                    found = decide(branch, at, self.side);
+                    found = decide(branch, at, self.side, self.hold_mode,self.short_qam,self.x2);
                 }
             }
         }
@@ -347,7 +397,9 @@ impl Receiver {
 }
 
 /// One branch's decision on a symbol, and the sequence it completes if any.
-fn decide(branch: &mut Branch, symbol: (f64, f64), side: Side) -> Option<Info> {
+enum Received { Info(Info), Hold(crate::v92::HoldMessage) }
+
+fn decide(branch: &mut Branch, symbol: (f64, f64), side: Side, hold_mode: bool,short_qam:bool,x2:bool) -> Option<Received> {
     // The differential decision: a point turned half way round from the last
     // one is a 1. Nothing about the carrier's absolute phase matters, which is
     // why there is no carrier loop here at all -- a few hertz of offset turns
@@ -362,7 +414,12 @@ fn decide(branch: &mut Branch, symbol: (f64, f64), side: Side) -> Option<Info> {
     branch.bits.push_back(turned < 0.0);
 
     let bits = branch.bits.make_contiguous();
-    for &length in side.lengths() {
+    if hold_mode {
+        let length = crate::v92::HoldMessage::BITS - info::FILL.len();
+        if bits.len() < length { return None; }
+        return crate::v92::HoldMessage::from_bits(&bits[bits.len() - length..]).map(Received::Hold);
+    }
+    for &length in side.lengths(x2) {
         // Checked the moment the CRC is in: the trailing fill says nothing,
         // and whatever follows a sequence may not be ones at all.
         let without_fill = length - info::FILL.len();
@@ -371,16 +428,21 @@ fn decide(branch: &mut Branch, symbol: (f64, f64), side: Side) -> Option<Info> {
         }
         let candidate = &bits[bits.len() - without_fill..];
         let found = match (side, length) {
+            (Side::Call, info::X2_MARKER_BITS) => info::X2Marker::from_bits(candidate).map(Info::X2Marker),
             (_, info::INFO0_BITS) => Info0::from_bits(candidate).map(Info::Info0),
             (Side::Call, info::INFO0D_BITS) => Info0d::from_bits(candidate).map(Info::Info0d),
             (Side::Call, _) => Info1c::from_bits(candidate).map(Info::Info1c),
             // The same length either way; bits 37:39 say which.
+            (Side::Answer, _) if short_qam => crate::v92::ShortQamRequest::from_bits(candidate)
+                .map(Info::Info1aShortQam)
+                .or_else(|| crate::v92::PcmUpstreamRequest::from_bits(candidate).map(Info::Info1aPcmUpstream)),
             (Side::Answer, _) => Info1a::from_bits(candidate)
                 .map(Info::Info1a)
-                .or_else(|| Info1aPcm::from_bits(candidate).map(Info::Info1aPcm)),
+                .or_else(|| Info1aPcm::from_bits(candidate).map(Info::Info1aPcm))
+                .or_else(|| crate::v92::PcmUpstreamRequest::from_bits(candidate).map(Info::Info1aPcmUpstream)),
         };
         if found.is_some() {
-            return found;
+            return found.map(Received::Info);
         }
     }
     None

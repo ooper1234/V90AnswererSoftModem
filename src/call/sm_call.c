@@ -98,18 +98,98 @@ static void start_bbs_selector(sm_call_t *c)
 static int call_get_bit(void *ud)
 {
     sm_call_t *c = ud;
-    int b = sm_bitq_pop(&c->txbits);
+    int b;
+
+    if (c->tx_lead_mark > 0)
+    {
+        c->tx_lead_mark--;
+        return 1;
+    }
+    b = sm_bitq_pop(&c->txbits);
 
     /* Idle line is all ones when there is nothing to send. */
     return (b < 0) ? 1 : b;
 }
+
+static void call_put_bit(void *ud, int bit);
+
+/* The C V.22bis pump's own line bits. Once V.22bis is in data mode they go
+   through V.42 (c->v22_ec), which hands the DTE side to call_get_bit and
+   call_put_bit; before that, and with V22_V42=0, straight there as always. */
+static int v22_get_bit(void *ud)
+{
+    sm_call_t *c = ud;
+#ifdef SM_HAVE_BM
+    if (c->v22_ec)
+        return bm_ec_tx_bit((bm_ec_link *) c->v22_ec);
+#endif
+    return call_get_bit(ud);
+}
+
+static void v22_put_bit(void *ud, int bit)
+{
+    sm_call_t *c = ud;
+#ifdef SM_HAVE_BM
+    if (c->v22_ec)
+    {
+        if (bit >= 0)
+            bm_ec_rx_bit((bm_ec_link *) c->v22_ec, bit);
+        return;
+    }
+#endif
+    call_put_bit(ud, bit);
+}
+
+#ifdef SM_HAVE_BM
+/* Timers and phase logging for a V.42 link outside the engine (V.22bis in
+   C, or Bell 103 in the engine's transparent FSK service). */
+static void ec_link_service(sm_call_t *c, int n, const char *label)
+{
+    bm_ec_link *ec = (bm_ec_link *) c->v22_ec;
+    int ms;
+
+    c->v22_tick_rem += n * 1000;
+    ms = c->v22_tick_rem / SM_SAMPLE_RATE;
+    c->v22_tick_rem -= ms * SM_SAMPLE_RATE;
+    bm_ec_tick(ec, ms);
+    if (bm_ec_link_peer_released(ec) && c->phase != SM_CALL_HANGUP)
+    {
+        sm_log_message(&c->log, SM_LOG_FLOW,
+                       "call ended: %s caller released V.42 (DISC, ATH), hanging up", label);
+        c->phase = SM_CALL_HANGUP;
+    }
+    /*endif*/
+    if (bm_ec_link_phase(ec) != c->v22_ec_seen)
+    {
+        static const char *const names[] = {"detection", "XID", "LAPM", "transparent"};
+        int ep = bm_ec_link_phase(ec);
+
+        c->v22_ec_seen = ep;
+        if (ep >= 0 && ep <= 3)
+            sm_log_message(&c->log, SM_LOG_FLOW,
+                           "%s: V.42 %s; error control=%s compression=%s",
+                           label, names[ep], ep == 2 ? "V.42 LAPM" : "none",
+                           bm_ec_link_compression(ec) == 2 ? "V.44" :
+                           bm_ec_link_compression(ec) == 1 ? "V.42bis" : "none");
+    }
+}
+
+/* V.42 over Bell 103 unless B103_V42=0. */
+static int b103_v42(void)
+{
+    const char *e = getenv("B103_V42");
+    return !(e && strcmp(e, "0") == 0);
+}
+#endif
 
 /* LAPM has already acknowledged these bytes. A physical retrain must not
    discard them at the DTE boundary or reset their async framing. */
 static int retains_validated_rx(sm_call_t *c)
 {
 #ifdef SM_HAVE_BM
-    return c->bm && c->ppp_started && bm_error_control(c->bm);
+    return c->ppp_started
+           && ((c->bm && bm_error_control(c->bm))
+               || (c->v22_ec && bm_ec_link_phase((bm_ec_link *) c->v22_ec) == 2));
 #else
     (void)c;
     return 0;
@@ -243,7 +323,10 @@ void sm_call_init(sm_call_t *c, const sm_call_config_t *cfg, int call_id)
            entirely -- until the engine hands a V.22bis call back, which
            bm_poll does. The V.22bis engine is still initialised here: the
            hand-back runs it. */
-        c->bm = cfg->v32_max_rate
+        c->bm = cfg->v23_mode
+                    ? bm_create_v23(1, cfg->v23_mode == 2,
+                                    call_get_bit, c, call_put_bit, c)
+                    : cfg->v32_max_rate
                     ? bm_create_v32(1, cfg->v32_max_rate,
                                     call_get_bit, c, call_put_bit, c)
                     : cfg->use_v90
@@ -254,13 +337,15 @@ void sm_call_init(sm_call_t *c, const sm_call_config_t *cfg, int call_id)
         if (c->bm)
         {
             c->phase = SM_CALL_V8;
-            sm_log_message(&c->log, SM_LOG_FLOW, cfg->v32_max_rate
+            sm_log_message(&c->log, SM_LOG_FLOW, cfg->v23_mode
+                           ? "BinModem V.23 answerer started (transparent split-speed FSK)"
+                           : cfg->v32_max_rate
                            ? "BinModem V.32/V.32bis answerer started (V.42/V.42bis)"
                            : cfg->use_v90
                            ? "BinModem answerer started (V.90 + V.34 fallback, 8 kHz line path)"
                            : "BinModem answerer started (V.8 + V.34, 16 kHz engine)");
             v22bis_init(&c->modem, false /* answerer */, cfg->rate,
-                        call_get_bit, c, call_put_bit, c, call_status, c);
+                        v22_get_bit, c, v22_put_bit, c, call_status, c);
             c->modem.log.call_id = call_id;
             sm_log_set_level(&c->modem.log, cfg->log_level);
             sm_bitq_init(&c->txbits);
@@ -272,7 +357,7 @@ void sm_call_init(sm_call_t *c, const sm_call_config_t *cfg, int call_id)
     }
 #endif
     v22bis_init(&c->modem, false /* answerer */, cfg->rate,
-                call_get_bit, c, call_put_bit, c, call_status, c);
+                v22_get_bit, c, v22_put_bit, c, call_status, c);
     c->modem.log.call_id = call_id;
     sm_log_set_level(&c->modem.log, cfg->log_level);
     sm_bitq_init(&c->txbits);
@@ -580,6 +665,7 @@ static void pump_ppp(sm_call_t *c)
         {
             sm_log_message(&c->log, SM_LOG_INFO, "pppd closed the pty");
             c->ppp_fd = -1;
+            c->ppp_closed = 1;
         }
     }
 }
@@ -598,6 +684,9 @@ static void bm_poll(sm_call_t *c, int n)
     int st = bm_status(c->bm);
     const char *ph = bm_phase(c->bm);
     int ep = bm_ec_phase(c->bm);
+
+    if (c->v22_ec)
+        ec_link_service(c, n, "Bell 103");
 
     if (strcmp(ph, c->bm_phase_seen) != 0)
     {
@@ -622,6 +711,15 @@ static void bm_poll(sm_call_t *c, int n)
                            names[ep], bm_lapm_declared(c->bm),
                            bm_ec_observed(c->bm), bm_damaged_frames(c->bm));
     }
+
+    if (bm_ec_peer_released(c->bm))
+    {
+        sm_log_message(&c->log, SM_LOG_FLOW,
+                       "call ended: caller released V.42 (DISC, ATH), hanging up");
+        c->phase = SM_CALL_HANGUP;
+        return;
+    }
+    /*endif*/
 
     if (st == BM_FAILED)
     {
@@ -649,6 +747,39 @@ static void bm_poll(sm_call_t *c, int n)
         c->rx_guard = SM_SAMPLE_RATE * 500 / 1000;
 #endif
         c->phase = SM_CALL_HANDSHAKE;
+        if (st == BM_AGREED_OTHER) {
+            c->legacy_probe=1;c->legacy_elapsed=0;c->legacy_v22_seen=0;
+            sm_legacy_detect_init(&c->legacy_detector);
+            sm_log_message(&c->log, SM_LOG_FLOW, "legacy auto selection: V.22bis / Bell 103 / V.21 / HST, then V.23");
+        }
+        {
+            int delay = 0;
+            double pk = 0.0, en = 0.0;
+            bm_echo(c->bm, &delay, &pk, &en);
+            c->v22_round_trip_ms = delay * 1000 / SM_SAMPLE_RATE;
+            c->v22_lapm_declared = st == BM_AGREED_V22 && bm_lapm_declared(c->bm);
+            if (st == BM_AGREED_V22)
+            {
+                /* Our JM is 1650 Hz FSK, inside the V.22bis receive band,
+                   and its echo from the far end keeps arriving for one
+                   round trip after we stop sending it (about a second on
+                   long VoIP routes). Heard as the caller's carrier it runs
+                   our sequence ahead of a caller that has not started. The
+                   caller cannot answer U11 sooner than a round trip plus
+                   its own 155 + 456 ms, so squelching for the round trip
+                   plus a margin loses nothing. (rx_guard above only exists
+                   in builds with the spandsp V.8 library.) */
+                int guard_ms = c->v22_round_trip_ms + 100;
+                if (guard_ms < 500)
+                    guard_ms = 500;
+                if (guard_ms > 2500)
+                    guard_ms = 2500;
+                c->v22_rx_guard = SM_SAMPLE_RATE / 1000 * guard_ms;
+                sm_log_message(&c->log, SM_LOG_FLOW,
+                               "V.22bis: receiver squelched %d ms (round trip %d ms)",
+                               guard_ms, c->v22_round_trip_ms);
+            }
+        }
         bm_destroy(c->bm);
         c->bm = NULL;
         return;
@@ -676,6 +807,29 @@ static void bm_poll(sm_call_t *c, int n)
             reset_unvalidated_rx(c);
             c->phase = SM_CALL_DATA;
             c->negotiated_rate = rate;
+            /* Text goes out back-to-back; a V.23 caller whose receiver
+               joined it on the wrong bit stays misframed for the whole
+               screen (letters bit-rotated, spaces and CR/LF lost) unless
+               there is idle mark between characters to resync on. */
+            if (ph && strncmp(ph, "Bell 103", 8) == 0 && b103_v42() && !c->v22_ec)
+            {
+                c->v22_ec = bm_ec_create(1 /* answer */, 0, 300, c->v22_round_trip_ms,
+                                         call_get_bit, c, call_put_bit, c);
+                c->v22_ec_seen = -1;
+                c->v22_tick_rem = 0;
+                sm_log_message(&c->log, SM_LOG_FLOW,
+                               "Bell 103: V.42 detection (round trip %d ms)",
+                               c->v22_round_trip_ms);
+            }
+            if (ph && (strncmp(ph, "V.23", 4) == 0 || strncmp(ph, "Bell 103", 8) == 0))
+            {
+                c->txbits.stop_bits = 2;
+                /* And a second of mark first: the login screen used to start
+                   ~1.4 s after our carrier, before the caller's receiver had
+                   settled, so it joined mid-character. Idle mark gives it a
+                   clean first start bit to lock on. */
+                c->tx_lead_mark = bm_rate_tx(c->bm);
+            }
             sm_log_message(&c->log, SM_LOG_FLOW,
                            "==> DATA MODE at %d bps rx, %d bps tx (%s)",
                            rate, bm_rate_tx(c->bm), ph);
@@ -707,9 +861,47 @@ static void bm_poll(sm_call_t *c, int n)
 }
 #endif
 
+int sm_call_server_closed_step(long long *since_close, long long *since_drained,
+                               int n, int drained)
+{
+    *since_close += n;
+    *since_drained = drained ? *since_drained + n : 0;
+    return *since_drained >= 2LL * SM_SAMPLE_RATE
+        || *since_close >= 20LL * SM_SAMPLE_RATE;
+}
+
+/* The BBS logged the caller off, or PPP ended: hang up rather than leave
+   the caller on a line that can never carry anything again. */
+static void server_closed_service(sm_call_t *c, int n)
+{
+    int drained;
+
+    if (!c->ppp_closed || c->phase == SM_CALL_HANGUP)
+        return;
+    drained = sm_bitq_count(&c->txbits) == 0;
+#ifdef SM_HAVE_BM
+    /* Not bm_pending: V.42 keeps the engine's transmitter topped up with
+       flags all call, so it never reads empty (2026-11-20 call 8 waited for
+       the 20 s backstop and the caller hung up first). The far end's
+       acknowledgement of every frame is what says the last bytes are out. */
+    if (c->bm)
+        drained = drained && bm_tx_delivered((bm_answerer *) c->bm);
+#endif
+    if (sm_call_server_closed_step(&c->ppp_closed_samples, &c->ppp_drained_samples, n, drained))
+    {
+        sm_log_message(&c->log, SM_LOG_FLOW,
+                       "call ended: the server side closed (BBS logoff or PPP ended) %.1f s ago%s, hanging up",
+                       (double) c->ppp_closed_samples / SM_SAMPLE_RATE,
+                       drained ? "" : " and the last bytes would not drain");
+        c->phase = SM_CALL_HANGUP;
+    }
+}
+
 static void process_audio(sm_call_t *c, const int16_t *in, int n)
 {
     int i = 0;
+
+    server_closed_service(c, n);
 
     if ((c->cap_in  ||  c->cap_out)  &&  c->cap_count < 120L*SM_SAMPLE_RATE)
     {
@@ -724,6 +916,67 @@ static void process_audio(sm_call_t *c, const int16_t *in, int n)
     /*endif*/
 
 #ifdef SM_HAVE_BM
+    if (!c->bm && c->legacy_probe && c->phase == SM_CALL_HANDSHAKE) {
+        int detected=0;
+        for (int k=0;k<n;k++) {
+            int d=sm_legacy_detect_step(&c->legacy_detector,in[k]/32768.0);
+            if (d==1) detected=1;
+            if (d==3 && !detected) detected=3;
+            if (d==4 && !detected) detected=4;
+            if (d==2) c->legacy_v22_seen=1;
+        }
+        c->legacy_elapsed+=n;
+        if (c->legacy_v22_seen && c->legacy_probe>=2) {
+            c->legacy_probe=1;
+            v22bis_restart(&c->modem);
+            sm_log_message(&c->log, SM_LOG_FLOW, "legacy caller: qualified V.22 low channel; resuming V.22bis");
+        }
+        if (detected==1 && !c->legacy_v22_seen) {
+            /* Through the V.42 hooks: they pass straight to call_get_bit /
+               call_put_bit until data mode starts the link. */
+            c->bm=bm_create_bell103(1,v22_get_bit,c,v22_put_bit,c);
+            if (c->bm && b103_v42())
+                bm_set_raw_line_bits(c->bm,1);
+            c->legacy_probe=0;
+            sm_deframer_init(&c->deframer);
+            sm_log_message(&c->log, SM_LOG_FLOW, "legacy caller: qualified 1270 Hz mark -> Bell 103 (300/300)");
+        } else if (detected==4 && !c->legacy_v22_seen) {
+            /* The caller is on HST's back channel already, having heard our
+               answer tone end: hold the forward channel at once. */
+            c->bm=bm_create_hst(1,call_get_bit,c,call_put_bit,c);
+            c->legacy_probe=0;
+            sm_deframer_init(&c->deframer);
+            sm_log_message(&c->log, SM_LOG_FLOW, "legacy caller: qualified HST back channel -> HST (MNP)");
+        } else if (detected==3 && !c->legacy_v22_seen) {
+            c->bm=bm_create_v21(1,call_get_bit,c,call_put_bit,c);
+            c->legacy_probe=0;
+            sm_deframer_init(&c->deframer);
+            sm_log_message(&c->log, SM_LOG_FLOW, "legacy caller: qualified 980 Hz mark -> V.21 (300/300)");
+        } else if (!c->legacy_v22_seen && c->legacy_probe==1 && c->legacy_elapsed>=5*SM_SAMPLE_RATE) {
+            c->legacy_probe=2;c->legacy_elapsed=0;c->tone_phase=0;
+            sm_log_message(&c->log, SM_LOG_FLOW, "no V.22bis response; probing Bell 103 with 2225 Hz mark");
+        } else if (!c->legacy_v22_seen && c->legacy_probe==2 && c->legacy_elapsed>=3*SM_SAMPLE_RATE) {
+            /* V.21's caller waits for V.21's own answer mark, 1650 Hz:
+               neither V.22bis's USB1 nor Bell's 2225 Hz starts it. */
+            c->legacy_probe=3;c->legacy_elapsed=0;c->tone_phase=0;
+            sm_log_message(&c->log, SM_LOG_FLOW, "no V.22bis/Bell 103 response; probing V.21 with 1650 Hz mark");
+        } else if (!c->legacy_v22_seen && c->legacy_probe==3 && c->legacy_elapsed>=3*SM_SAMPLE_RATE) {
+            c->bm=bm_create_v23(1,0,call_get_bit,c,call_put_bit,c);
+            c->legacy_probe=0;
+            sm_deframer_init(&c->deframer);
+            sm_log_message(&c->log, SM_LOG_FLOW, "no V.22bis/Bell 103/V.21 response; probing V.23 with 1300 Hz mark");
+        }
+        if (c->legacy_probe>=2) {
+            double hz=c->legacy_probe==2 ? 2225 : 1650;
+            for (int k=0;k<n;k++) {
+                c->txbuf[k]=sm_sat16((float)(9000*sin(c->tone_phase)));
+                c->tone_phase+=2*3.14159265358979323846*hz/SM_SAMPLE_RATE;
+                if (c->tone_phase>2*3.14159265358979323846) c->tone_phase-=2*3.14159265358979323846;
+            }
+            c->samples_in+=n;c->samples_out+=n;
+            return;
+        }
+    }
     if (c->bm)
     {
         int k;
@@ -787,6 +1040,18 @@ static void process_audio(sm_call_t *c, const int16_t *in, int n)
         else
         {
             int m = n - i;
+            if (c->v22_rx_guard > 0  &&  c->mode == SM_CALL_MODE_V22)
+            {
+                int skip = (m < c->v22_rx_guard) ? m : c->v22_rx_guard;
+                static const int16_t quiet[SM_AS_MAX_PAYLOAD / 2];
+                if (skip > (int) (sizeof(quiet) / sizeof(quiet[0])))
+                    skip = (int) (sizeof(quiet) / sizeof(quiet[0]));
+                v22bis_tx(&c->modem, c->txbuf + i, skip);
+                v22bis_rx(&c->modem, quiet, skip);
+                c->v22_rx_guard -= skip;
+                i += skip;
+                m -= skip;
+            }
 #ifdef SM_HAVE_V8
             if (c->rx_guard > 0)
             {
@@ -957,13 +1222,33 @@ static void process_audio(sm_call_t *c, const int16_t *in, int n)
     {
         c->phase = SM_CALL_DATA;
         c->negotiated_rate = c->modem.negotiated_bit_rate;
+        c->legacy_probe = 0;
         c->modem.negotiated_bit_rate = c->negotiated_rate;
         sm_deframer_init(&c->deframer);
         sm_log_message(&c->log, SM_LOG_FLOW,
                        "==> DATA MODE at %d bps (%s)",
                        c->negotiated_rate,
                        c->modem.rx.sixteen_way_decisions ? "16-way" : "4-way");
+#ifdef SM_HAVE_BM
+        if (!c->v22_ec && !(getenv("V22_V42") && strcmp(getenv("V22_V42"), "0") == 0))
+        {
+            c->v22_ec = bm_ec_create(1 /* answer */, c->v22_lapm_declared, c->negotiated_rate,
+                                     c->v22_round_trip_ms, call_get_bit, c, call_put_bit, c);
+            c->v22_ec_seen = -1;
+            c->v22_tick_rem = 0;
+            sm_log_message(&c->log, SM_LOG_FLOW,
+                           "V.22bis: V.42 %s (round trip %d ms)",
+                           c->v22_lapm_declared ? "agreed in V.8: XID" : "detection",
+                           c->v22_round_trip_ms);
+        }
+#endif
     }
+
+#ifdef SM_HAVE_BM
+    /* With the engine running (Bell 103), bm_poll services the link. */
+    if (c->v22_ec && !c->bm)
+        ec_link_service(c, n, "V.22bis");
+#endif
 
     c->samples_in += n;
     c->samples_out += n;
@@ -1045,6 +1330,19 @@ int sm_call_run(sm_call_t *c, int socket_fd)
     int r;
     int timeout_count = 0;
     int rc = 0;
+    /* A call that has not reached data mode after this many seconds is hung
+       up, so a modem stuck in training (or a dead line Asterisk never ends)
+       does not hold a trunk channel and a caller slot. SM_HANDSHAKE_TIMEOUT
+       overrides it; 0 disables. Once data mode is reached it no longer
+       applies, including to later retrains. */
+    double handshake_limit = 120.0;
+    int reached_data = 0;
+    struct timespec call_started;
+    {
+        const char *e = getenv("SM_HANDSHAKE_TIMEOUT");
+        if (e && *e)
+            handshake_limit = atof(e);
+    }
 
     sm_log_message(&c->log, SM_LOG_FLOW, ">>> sm_call_run ENTRY socket_fd=%d call_id=%d phase=%d", socket_fd, c->call_id, c->phase);
 
@@ -1069,6 +1367,27 @@ int sm_call_run(sm_call_t *c, int socket_fd)
             char u[37];
             sm_ast_uuid_string(payload, u);
             sm_log_message(&c->log, SM_LOG_FLOW, "call start, UUID %s", u);
+#ifdef SM_HAVE_BM
+            /* UUID ...0091: the dialplan's mark for a caller whose modem
+               stalls in V.90 phase 3 after V.92 Quick Connect (a USR
+               Sportster: TRN for 3 s, then tone A, never Ja), where the same
+               modem trains when Quick Connect is not used. The engine reads
+               the offer when it is made, so it is made again here, before
+               any audio, without V.92. Each call is its own process, so
+               the setting goes no further than this call. */
+            if (strcmp(u, "00000000-0000-0000-0000-000000000091") == 0
+                && c->bm && c->cfg.use_v90 && !c->cfg.v23_mode && !c->cfg.v32_max_rate)
+            {
+                setenv("V92_QUICK_CONNECT", "0", 1);
+                bm_destroy(c->bm);
+                c->bm = bm_create_v90(1 /* answer */, call_get_bit, c, call_put_bit, c);
+                sm_log_message(&c->log, SM_LOG_FLOW, c->bm
+                               ? "V.92 and its Quick Connect not offered on this call (UUID 0091)"
+                               : "engine re-create without V.92 failed");
+                if (!c->bm)
+                    return -1;
+            }
+#endif
             break;
         }
         if (kind == SM_AS_KIND_AUDIO)
@@ -1084,8 +1403,28 @@ int sm_call_run(sm_call_t *c, int socket_fd)
        frame directly). Starting it here used to queue binary PPP across the
        modem before the post-CONNECT BBS/PPP choice could be shown. */
 
+    clock_gettime(CLOCK_MONOTONIC, &call_started);
     while (c->phase != SM_CALL_HANGUP)
     {
+        if (c->phase == SM_CALL_DATA)
+            reached_data = 1;
+        /*endif*/
+        if (!reached_data && handshake_limit > 0.0)
+        {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double waited = (double) (now.tv_sec - call_started.tv_sec)
+                          + (double) (now.tv_nsec - call_started.tv_nsec) / 1e9;
+            if (waited >= handshake_limit)
+            {
+                sm_log_message(&c->log, SM_LOG_FLOW,
+                               "call ended: no data mode after %.0f s of handshake, hanging up",
+                               waited);
+                break;
+            }
+            /*endif*/
+        }
+        /*endif*/
         r = sm_ast_read(&c->as, &kind, payload, sizeof(payload), &plen, 2000);
         if (r < 0)
         {
@@ -1168,6 +1507,16 @@ out:
                        c->negotiated_rate ? c->negotiated_rate : c->modem.negotiated_bit_rate,
                        c->phase == SM_CALL_DATA ? "DATA" : "HANDSHAKE",
                        d, pk, en);
+        unsigned long long cc[4];
+        if (c->bm  &&  bm_compression_counts(c->bm, cc))
+        {
+            /* Saved = the share of the plain bytes that never went on the line. */
+            sm_log_message(&c->log, SM_LOG_FLOW,
+                           "compression summary: down %llu -> %llu bytes (%.0f%% saved), up %llu -> %llu bytes (%.0f%% saved)",
+                           cc[0], cc[1], cc[0] ? 100.0*((double) cc[0] - (double) cc[1])/(double) cc[0] : 0.0,
+                           cc[3], cc[2], cc[3] ? 100.0*((double) cc[3] - (double) cc[2])/(double) cc[3] : 0.0);
+        }
+        /*endif*/
     }
     if (c->cap_in)
         fclose(c->cap_in);
@@ -1192,6 +1541,13 @@ out:
         c->bm = NULL;
     }
     /*endif*/
+    if (c->v22_ec)
+    {
+        sm_log_message(&c->log, SM_LOG_FLOW, "V.42 link: damaged_frames=%llu",
+                       bm_ec_link_damaged_frames((bm_ec_link *) c->v22_ec));
+        bm_ec_destroy((bm_ec_link *) c->v22_ec);
+        c->v22_ec = NULL;
+    }
 #endif
 #ifdef SM_HAVE_V34
     if (c->v34)

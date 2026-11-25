@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-rm -f /run/v90-uplink-ready
+rm -f /run/v90-uplink-ready /run/v90-uplink-configured
 chmod 600 /opt/v90/wifi/wifi-uplink.json
 chmod +x /opt/v90/wifi/ppp-slirp.py
 test -c /dev/ppp || mknod /dev/ppp c 108 0
@@ -15,12 +15,16 @@ fi
 uplink=$!
 cleanup() { kill "$uplink" ${server:-} ${proxy:-} 2>/dev/null || true; }
 trap cleanup EXIT TERM INT
+# VPN outages must not restart established PPP links. Admission remains
+# gated by uplink-ready inside server.py; wait here only for the kill switch.
+marker=/run/v90-uplink-ready
+if [ "${V90_UPLINK:-wifi}" = vpngate ]; then marker=/run/v90-uplink-configured; fi
 for attempt in $(seq 1 40); do
- test -f /run/v90-uplink-ready && break
+ test -f "$marker" && break
  kill -0 "$uplink"
  sleep 1
 done
-test -f /run/v90-uplink-ready
+test -f "$marker"
 python3 /opt/v90/multilink/web_proxy.py &
 proxy=$!
 python3 /opt/v90/multilink/server.py &

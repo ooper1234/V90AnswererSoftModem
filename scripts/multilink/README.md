@@ -4,10 +4,17 @@
 
 Set `V90_UPLINK=vpngate` and `V90_PPP_DNS=1.1.1.1` on the dedicated
 PPP container, and mount a sanitized OpenVPN profile at
-`/opt/v90/vpn/vpngate.ovpn` read-only. The VPN launcher currently pins the
-tested relay `27.130.93.85:1233/udp`; changing relays requires updating
-the profile, transport firewall allowance and expected exit verification.
+`/opt/v90/vpn/vpngate.ovpn` read-only. The VPN launcher's compatibility defaults
+pin the originally tested relay `27.130.93.85:1233/udp`. That relay later became
+unavailable; select and test a current relay, matching the profile, transport
+firewall allowance and expected exit verification.
 Keep profile keys private and outside version control.
+
+To replace an unavailable relay, set `V90_VPN_RELAY`, `V90_VPN_PORT`, and
+`V90_VPN_PROTO` (`udp` or `tcp`) on the PPP container to match a separately
+sanitized and tested profile. The exit check expects that relay's public IP.
+Test the replacement in a separate network namespace, then switch during
+an idle window. These settings control the PPP container only.
 
 The VPN-enabled image needs OpenVPN, CA certificates, curl and iptables.
 Only the PPP container's default route changes. Its Docker control network
@@ -34,6 +41,11 @@ This backend terminates each modem's PPP link with native Linux `pppd` and
 joins links with the same peer endpoint discriminator into one kernel PPP
 bundle. RFC 1990 packet fragmentation, ordering and link removal are handled
 by Linux, rather than implemented inside the modem signal processor.
+
+The answerer starts PPP directly after modem CONNECT. It does not present a
+text `login:` prompt. Start a PPP client on the caller's modem byte stream;
+a terminal session alone will not negotiate a network connection. This test
+configuration uses `noauth`, so it does not request a username or password.
 
 The Wi-Fi/SLiRP configuration serves one Windows computer at a time:
 server `10.0.2.2`, client `10.0.2.15`, DNS `10.0.2.3`. It also accepts a
@@ -120,3 +132,26 @@ restore single-link SLiRP, and verify both Windows modem subentries.
 
 References: [pppd multilink documentation](https://ppp.samba.org/pppd.html),
 [RFC 1990](https://www.rfc-editor.org/rfc/rfc1990).
+
+### VPN relay recovery
+
+With VPN mode enabled, an optional `vpn/relays.json` lists alternative gateways. Each entry has `ip` (IPv4), `port`, `proto` (`udp` or `tcp`), and `profile` (an existing OpenVPN file directly inside the VPN directory). Without this file the existing single-relay environment configuration remains supported.
+
+The uplink supervisor installs the PPP kill switch before starting the backend, verifies the VPN public exit before admitting new PPP sessions, and rotates to another relay when a connection or repeated health checks fail. Existing PPP processes remain alive during recovery. Internet packets stay blocked while the tunnel is unavailable; SIP and RTP do not use this PPP VPN namespace. Volunteer VPN Gate relays may disappear, so configure and periodically verify multiple usable profiles. A failover interruption can still exceed client application timeouts.
+
+### PPP startup on slow modems
+
+The backend uses `silent` to wait for the caller's first valid LCP packet before sending its own configuration request. This avoids sending the initial request into the modem's post-training guard interval. LCP/IPCP retries and keepalive intervals are 30 seconds; the keepalive failure limit remains six. The adapter still negotiates multilink when the caller requests it.
+
+For Bell 103 or V.23, configure client LCP/IPCP retries at 30 seconds and allow several minutes for address negotiation. A short CONNECT result alone does not prove PPP is ready. Smaller client MRU/MTU values reduce serialization time, but do not repair physical framing errors. Preserve startup ping losses separately from later stability measurements.
+### TCP header compression
+
+Set `V90_PPP_VJ=1` to permit Van Jacobson TCP header compression negotiation.
+This reduces acknowledgement overhead on slow return channels such as V.23 at
+75 bps. The caller must also permit it; a peer that rejects the IPCP compression
+option continues with ordinary IP packets. Linux pppd and the kernel manage the
+compression contexts. This is separate from modem V.42bis data compression.
+Negotiation remains disabled by default: the current V.23 hardware retests
+terminated before transfer stability was verified. Set `V90_PPP_VJ=0` to disable
+the option again. Enabling negotiation does not by itself prove
+transfer or long-session stability; verify real traffic after changing it.

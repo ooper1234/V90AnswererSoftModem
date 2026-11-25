@@ -6,6 +6,7 @@
 #include "modem/v22bis/v22bis.h"
 #include "serial/sm_async.h"
 #include "ast_socket/sm_ast_socket.h"
+#include "sm_legacy_detect.h"
 
 #include <sys/types.h>
 #include <stdio.h>
@@ -49,6 +50,7 @@ typedef struct {
     int enable_ppp;
     int echo_data;                  /* loop data back instead of using pppd */
     int use_v8;                     /* run V.8 negotiation first */
+    int v23_mode;                  /* 0=off, 1=1200/75, 2=75/1200 */
     int v32_max_rate;               /* dedicated V.32: 9600; V.32bis: 14400 */
     int use_v34;                    /* offer V.34 in V.8 (opt-in; the V.34
                                        receive data path is not finished yet) */
@@ -79,12 +81,26 @@ typedef struct {
     /* BinModem answerer (bm_answerer_t *), when cfg.use_binmodem. NULL at
        other times and once the engine has handed a V.22bis call back. */
     void *bm;
+    /* V.42 over the C V.22bis (bm_ec_link *), from V.22bis data mode on;
+       what V.8 said about LAPM and the echo's round trip are kept from the
+       engine for it when it hands the call back. */
+    void *v22_ec;
+    int v22_lapm_declared;
+    int v22_round_trip_ms;
+    int v22_rx_guard;               /* samples of V.22bis RX squelch after a V.8 handover */
+    int v22_ec_seen;                /* last V.42 phase logged, -1 none */
+    int v22_tick_rem;               /* samples not yet counted as a ms */
     void *bbs;                     /* bbs_session_t while selecting/BBS */
     char bm_phase_seen[96];         /* last phase string logged */
     int bm_ec_seen;                 /* last V.42 phase logged */
     long bm_nocarrier;              /* samples since the far end's carrier */
+    sm_legacy_detect_t legacy_detector;
+    int legacy_probe;              /* 1: V.22, 2: Bell mark, 3: V.21 mark, 0: disabled */
+    long legacy_elapsed;
+    int legacy_v22_seen;
 
     sm_bitq_t txbits;               /* pppd bytes -> modem TX bits */
+    int tx_lead_mark;               /* idle mark bits still owed before TX data */
     sm_deframer_t deframer;         /* modem RX bits -> pppd bytes */
 
     /* answer tone generator */
@@ -98,6 +114,12 @@ typedef struct {
     int ppp_fd;
     pid_t pppd_pid;
     int ppp_started;
+    /* The server side (pppd, or the BBS behind the login screen) closed the
+       pty: nothing more can flow, so the call is hung up once its last
+       bytes are down the line (sm_call_server_closed_step). */
+    int ppp_closed;
+    long long ppp_closed_samples;   /* since the close */
+    long long ppp_drained_samples;  /* since everything queued was sent */
 
 #ifdef SM_HAVE_V8
     sm_v8_t *v8;
@@ -125,6 +147,13 @@ typedef struct {
     int16_t txbuf[SM_AS_MAX_PAYLOAD / 2];
     int16_t rxsquelch[SM_AS_MAX_PAYLOAD / 2];
 } sm_call_t;
+
+/* After the server side closed: count `n` more samples, `drained` when no
+   bytes are left to send. Returns 1 when it is time to hang up: 2 s after
+   the last bytes went (time for the final V.42 frames to be acknowledged
+   and the goodbye text to show), or 20 s after the close at the latest. */
+int sm_call_server_closed_step(long long *since_close, long long *since_drained,
+                               int n, int drained);
 
 /* Initialise a call with the given configuration. */
 void sm_call_init(sm_call_t *c, const sm_call_config_t *cfg, int call_id);
