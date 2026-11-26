@@ -5,42 +5,6 @@ G.711 ATA and Asterisk AudioSocket. It uses the vendored BinModem engine,
 offers V.42 LAPM error correction and V.42bis compression, and can provide
 PPP networking. It is an experimental modem implementation.
 
-## Modulations
-
-What the server answers, and how a caller gets there. Speeds are the most
-each mode carries; what a call reaches depends on the line.
-
-| Modulation | Down / up (bit/s) | How it is selected | Status |
-|---|---|---|---|
-| V.90 | up to 56 000 / 33 600 | V.8, caller offers V.90 | Main mode, live-tested |
-| V.92 PCM upstream | up to 56 000 / 48 000 | V.8, caller offers V.92; needs `V92_PCM_UPSTREAM=1` | Experimental |
-| V.92 Quick Connect, modem-on-hold | as V.90 | V.8 / V.8bis | Experimental |
-| U.S. Robotics x2 | up to 56 000 / 33 600 | caller's x2 marker in V.34 phase 2; needs `V90_X2=1`, mu-law only | Experimental |
-| V.34 | up to 33 600 | V.8, or fallback from failed V.90 training | Live-tested |
-| V.32bis / V.32 | 14 400 / 9 600 | V.8, or a legacy caller's AA tone | Live-tested |
-| V.22bis / V.22 | 2 400 / 1 200 | V.8, or the legacy probe | Live-tested |
-| V.23 | 1 200 / 75 (or reversed) | V.8, `--v23`, or last in the legacy probe | CONNECT tested, PPP not |
-| Bell 103 | 300 / 300 | legacy probe (2225 Hz mark) | CONNECT tested |
-| V.21 | 300 / 300 | legacy probe (1650 Hz mark) | Simulation-tested |
-| U.S. Robotics HST | 14 400 / 450 (or 300) | caller's back channel heard during the legacy probe | Simulation-tested; see below |
-
-Error control and compression: V.42 LAPM with V.42bis or V.44 on V.22bis
-and faster modes (V.42 on Bell 103 with `B103_V42=1`). HST carries MNP
-error control, with 256-octet frames that shrink on a noisy line.
-
-**Legacy probe.** A caller that does not answer V.8 still hears ANSam.
-After it the server tries, in turn: V.32 (if the caller sent AA), V.22bis
-(5 s), a Bell 103 mark (3 s), a V.21 mark (3 s), then V.23. A caller's own
-tone at any point (Bell 103's 1270 Hz, V.21's 980 Hz, V.22's 1200 Hz or
-HST's back channel near 375 Hz) selects its mode straight away.
-
-**HST** comes from BinModem, which rebuilt it from a Courier V.Everything's
-firmware. Its forward-channel training and pulse shapes are not the
-Courier's, so a real U.S. Robotics Courier may not connect; BinModem dialling
-with `AT+MS=HST` does. HST 16 800 and 4 800 are not implemented.
-
-Not supported: K56flex (never published), V.32terbo, V.FC.
-
 ## What was tested
 
 October 6 reliability updates add bounded V.90 receiver acquisition recovery,
@@ -121,70 +85,27 @@ coefficients paired with the delay used for validation. On the tested home
 PAP2, three connected calls each completed three verified page downloads
 with these settings; two other calls still failed during startup.
 
-## Install
+## Requirements and build
 
-The server runs on Linux (or in Docker). You also need Asterisk with
-`app_audiosocket`, and a way for modems to reach it: a G.711 ATA with a
-modem on its phone port, or a SIP trunk. Calls must stay G.711 end to end
-(u-law for x2 and PCM upstream) with silence suppression off.
+The server runs on Linux. Windows can run the server through Docker Desktop
+and use a physical USB modem as the calling client. You need Asterisk with
+`app_audiosocket`, a G.711 ATA, and a modem connected to its phone port.
 
-### Native build
-
-Install a current Rust toolchain (edition 2024, via https://rustup.rs),
-GCC, CMake, Python 3 and either `slirp` or `ppp`. The BBS loads SQLite
-at run time if it is there. On Ubuntu or Debian:
+For a native build, install a current Rust toolchain (edition 2024), GCC,
+CMake, Python 3 and either `ppp` or `slirp`. On Ubuntu/Debian:
 
 ```sh
 sudo apt-get update
-sudo apt-get install build-essential cmake python3 libsqlite3-0 slirp ppp
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo apt-get install build-essential cmake python3 ppp slirp
 git clone https://github.com/ooper1234/V90AnswererSoftModem.git
 cd V90AnswererSoftModem
 sh scripts/build-v90.sh
 ```
 
-That builds `build/sm_daemon`. Run it with the same options the container
-uses (PPP through userspace SLiRP, no root needed):
-
-```sh
-./build/sm_daemon --listen 127.0.0.1 --port 9093 --v90 --v34 \
-    --pppd "$PWD/scripts/ppp-slirp.py" \
-    --local-ip 10.0.2.2 --peer-ip 10.0.2.15 --dns1 10.0.2.3 \
-    --log-dir /tmp/v90 --debug
-```
-
-`./build/sm_daemon --help` lists every option.
-
-### Docker
+Alternatively, build the included container from the repository directory:
 
 ```sh
 docker build -t v90-answerer .
-docker run -d --name v90-answerer --network container:<your-asterisk-container> v90-answerer
-```
-
-The image's default command is the one above. Sharing Asterisk's network
-namespace lets AudioSocket reach `127.0.0.1:9093`.
-
-### Optional modes
-
-These are environment variables, off unless set:
-
-| Variable | Effect |
-|---|---|
-| `V90_X2=1` | Answer U.S. Robotics x2 callers (mu-law lines only) |
-| `V92_PCM_UPSTREAM=1` | Offer V.92 PCM upstream. PCM is never offered without it |
-| `V92_PCM_ECHO=1` | Echo canceller for PCM upstream (use with the above) |
-| `B103_V42=1` | V.42 error control on Bell 103 |
-| `V22_V42=0` | Turn V.42 off on V.22bis |
-| `V8BIS_ENABLE=1` | Answer with V.8bis signalling |
-
-With Docker, pass them with `-e`, for example `-e V90_X2=1`.
-
-### Tests
-
-```sh
-cargo test --release --manifest-path third_party/BinModem/Cargo.toml -p binmodemffi -p datapump -p ec
-cmake --build build --target legacy_detect_test && ./build/legacy_detect_test
 ```
 
 ## Asterisk and ATA setup
@@ -564,8 +485,3 @@ retrains returned to data mode. It returned 128/138 pings, passed 42/46 verified
 uploads and 41/46 webpage and bulk downloads. Intermittent stalls remain;
 connection survival is verified for this trial, but uninterrupted data transfer
 and multilink reliability are not established by it.
-
-
-### V.23 / V23C
-
-Split-speed FSK is available with `--v23` or `--v23c` (1200 bit/s down, 75 up), or `--v23-reverse` (75 down, 1200 up). The normal V.8 menu also selects transparent V.23 duplex when that is the best common mode. On the normal BinModem route, unanswered V.8 falls through legacy V.32 detection, V.22bis/Bell 103/V.21/HST response detection, a Bell 103 mark probe, a V.21 mark probe, then V.23 (see [Modulations](#modulations)). Higher-speed negotiated modes retain their preference. See [V.23 and Bell 103 setup and validation](docs/v23.md). October 11 real-modem trials reached Bell 103 and V.23 CONNECT on that route, but neither completed PPP.
