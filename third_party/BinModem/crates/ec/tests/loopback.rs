@@ -125,7 +125,12 @@ where
             b.lapm.tick(t401);
             continue;
         }
-        quiet = 0;
+        // An idle connected link probes the peer every few seconds and the
+        // peer answers (lapm.rs, PROBE_AFTER_MS): one supervisory frame each
+        // way, 56 bits plus stuffing. That is a link with nothing left to say.
+        if from_a.len().max(from_b.len()) > 80 {
+            quiet = 0;
+        }
         if !from_a.is_empty() {
             let delivered = channel(&from_a, burst);
             burst += 1;

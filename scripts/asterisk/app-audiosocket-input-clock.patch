@@ -1,0 +1,37 @@
+--- a/apps/app_audiosocket.c
++++ b/apps/app_audiosocket.c
+@@ -42,6 +42,7 @@
+ #include "asterisk/utils.h"
+ #include "asterisk/time.h"
+ #include "asterisk/format_cache.h"
++#include "audiosocket-modem-input-clock.h"
+ 
+ #define AST_MODULE "app_audiosocket"
+ #define AUDIOSOCKET_CONFIG "audiosocket.conf"
+@@ -168,6 +169,7 @@
+ 	int outfd = -1;
+ 	struct ast_frame *f;
+ 	struct timeval next_delivery = { 0, 0 };
++	struct modem_input_clock input_clock = { 0, 0 };
+ 
+ 	if (!chan || ast_channel_state(chan) != AST_STATE_UP) {
+ 		ast_log(LOG_ERROR, "Channel is %s\n", chan ? "not answered" : "missing");
+@@ -191,12 +193,16 @@
+ 			}
+ 
+ 			if (f->frametype == AST_FRAME_VOICE) {
+-				/* Send audio frame to audiosocket */
+-				if (ast_audiosocket_send_frame(svc, f)) {
++				/* Preserve missing RTP samples before the timestamp-free socket. */
++				long filled_before = input_clock.missing_samples;
++				if (modem_send_input(svc, f, &input_clock)) {
+ 					ast_log(LOG_ERROR, "Failed to forward channel frame from %s to AudioSocket\n",
+ 						chanName);
+ 					ast_frfree(f);
+ 					return -1;
++				}
++				if (input_clock.missing_samples != filled_before) {
++					ast_log(LOG_NOTICE, "AudioSocket preserved %ld missing input samples on %s\n", input_clock.missing_samples - filled_before, chanName);
+ 				}
+ 			}
+ 			ast_frfree(f);

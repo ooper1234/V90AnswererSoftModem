@@ -253,7 +253,9 @@ fn run_mode(peer_compression: bool, enable_compression: bool, fallback: bool, ec
         assert_eq!(upstream_rate, 28_800, "configured V.90 upstream cap");
     } else {
         assert!(rate >= 48_000);
-        assert_eq!(upstream_rate, 33_600, "full-rate V.90 upstream");
+        // The server's INFO0d leaves bit 40 (3429-baud upstream) clear, so
+        // V.90's V.34 upstream runs at 3200 baud, whose top rate is 31 200.
+        assert_eq!(upstream_rate, 31_200, "full-rate V.90 upstream at 3200 baud");
     }
     assert!(got_down == down, "downstream bytes: received {} of {}", got_down.len(), down.len());
     assert!(got_up == up, "upstream bytes: received {} of {}", got_up.len(), up.len());

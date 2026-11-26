@@ -25,6 +25,10 @@ use crate::bell103::Bell103Tx;
 /// channel and there is nothing to collide with.
 pub const CHANNEL_2: (f64, f64) = (1850.0, 1650.0);
 
+/// Channel 1, the low channel, as `(space, mark)`: V.8 bis puts its
+/// initiating station's messages here (V.8 bis 7.2.1).
+pub const CHANNEL_1: (f64, f64) = (1180.0, 980.0);
+
 pub const BAUD: f64 = 300.0;
 
 /// The calling tone: 1100 Hz, half a second on and three seconds off
@@ -92,7 +96,12 @@ pub struct Sender {
 
 impl Sender {
     pub fn new(fs: f64) -> Self {
-        let (space, mark) = CHANNEL_2;
+        Self::on(CHANNEL_2, fs)
+    }
+
+    /// A sender on either channel, as `(space, mark)`.
+    pub fn on(channel: (f64, f64), fs: f64) -> Self {
+        let (space, mark) = channel;
         let mut tx = Bell103Tx::with_tones(space, mark, fs);
         tx.set_transmitting(false);
         Self { tx }
@@ -157,7 +166,12 @@ const PULL: f64 = 0.125;
 
 impl Receiver {
     pub fn new(fs: f64) -> Self {
-        let (space, mark) = CHANNEL_2;
+        Self::on(CHANNEL_2, fs)
+    }
+
+    /// A receiver on either channel, as `(space, mark)`.
+    pub fn on(channel: (f64, f64), fs: f64) -> Self {
+        let (space, mark) = channel;
         Self {
             detector: FskDetector::new(space, mark, BAUD, fs),
             sps: fs / BAUD,
@@ -210,6 +224,12 @@ impl Receiver {
 
     pub fn carrier(&self) -> bool {
         self.detector.carrier()
+    }
+
+    /// How much signal there is in this channel's band: the magnitude of
+    /// the band-filtered line, which for a tone of amplitude A is A over two.
+    pub fn band_level(&self) -> f64 {
+        self.detector.level()
     }
 
     /// Decision margin at the last bit, which is what a scope plots.

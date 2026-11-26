@@ -59,6 +59,9 @@ fn the_info_sequences_of_a_real_call_check() {
                 Info::Info1a(_) => "INFO1a",
                 Info::Info0d(_) => "INFO0d",
                 Info::Info1aPcm(_) => "INFO1a (V.90)",
+                Info::Info1aShortQam(_) => "INFO1a (V.92 short QAM)",
+                Info::Info1aPcmUpstream(_) => "INFO1a (V.92 PCM upstream)",
+                Info::X2Marker(_) => "x2 marker",
             };
             (*side, kind)
         })

@@ -50,6 +50,26 @@ bm_answerer *bm_create_v90(int answer,
                            bm_get_bit_fn get_bit, void *get_ud,
                            bm_put_bit_fn put_bit, void *put_ud);
 
+/* V.23 transparent split-speed FSK. reversed=1 swaps the 1200/75 channels. */
+bm_answerer *bm_create_v23(int answer, int reversed,
+                         bm_get_bit_fn get_bit, void *get_ud,
+                         bm_put_bit_fn put_bit, void *put_ud);
+/* Transparent Bell 103: 300 bit/s in both directions. */
+bm_answerer *bm_create_bell103(int answer,
+                         bm_get_bit_fn get_bit, void *get_ud,
+                         bm_put_bit_fn put_bit, void *put_ud);
+/* Transparent V.21: 300 bit/s in both directions on V.21's channels. */
+bm_answerer *bm_create_v21(int answer,
+                         bm_get_bit_fn get_bit, void *get_ud,
+                         bm_put_bit_fn put_bit, void *put_ud);
+/* U.S. Robotics HST (MNP inside), async characters both ways. The answerer
+   holds the forward channel from the start. */
+bm_answerer *bm_create_hst(int answer,
+                         bm_get_bit_fn get_bit, void *get_ud,
+                         bm_put_bit_fn put_bit, void *put_ud);
+/* Bell 103 / V.23: hand line bits up at the recovered bit clock rather than
+   as re-framed characters, for a V.42 link (bm_ec_link) run on top. */
+void bm_set_raw_line_bits(bm_answerer *a, int on);
 /* Dedicated V.32 (max_rate=9600) or V.32bis (max_rate=14400), with V.25
    answering tone, V.42 detection and negotiated V.42bis compression. */
 bm_answerer *bm_create_v32(int answer, int max_rate,
@@ -71,6 +91,7 @@ void bm_flush_rx(bm_answerer *a);
 
 int bm_status(bm_answerer *a);
 int bm_pending(bm_answerer *a);     /* bits queued in the engine's transmitter */
+int bm_tx_delivered(bm_answerer *a); /* 1: far modem has acknowledged all data (always 1 without V.42) */
 unsigned long long bm_rx_total(bm_answerer *a); /* bits the receiver handed up */
 int bm_found_again(bm_answerer *a);  /* decoder re-acquisitions */
 int bm_slips(bm_answerer *a);        /* sample slips seen by the receiver */
@@ -87,9 +108,29 @@ int bm_carrier(bm_answerer *a);     /* far end's data signal present */
 int bm_error_control(bm_answerer *a); /* V.42 LAPM established */
 int bm_compression(bm_answerer *a);   /* 0 none, 1 V.42bis, 2 V.44 */
 unsigned long long bm_damaged_frames(bm_answerer *a);
+/* plain sent, wire sent, wire received, plain received; 0 if none */
+int bm_compression_counts(bm_answerer *a, unsigned long long out[4]);
+int bm_ec_peer_released(bm_answerer *a);   /* far modem sent DISC (ATH) */
 int bm_ec_phase(bm_answerer *a);
 int bm_lapm_declared(bm_answerer *a);
 int bm_ec_observed(bm_answerer *a);
+
+/* V.42 for a pump outside the engine (the C V.22bis): the pump trades line
+   bits with the link, and the link trades an async DTE bit stream through
+   get_bit/put_bit as the pump did. Detection runs unless lapm_declared, so a
+   caller without V.42 falls back to a transparent async link. */
+typedef struct EcLink bm_ec_link;
+bm_ec_link *bm_ec_create(int answer, int lapm_declared, int line_bps, int round_trip_ms,
+                         bm_get_bit_fn get_bit, void *get_user,
+                         bm_put_bit_fn put_bit, void *put_user);
+void bm_ec_rx_bit(bm_ec_link *l, int bit);   /* a bit from the line */
+int bm_ec_tx_bit(bm_ec_link *l);             /* the next bit for the line */
+void bm_ec_tick(bm_ec_link *l, int ms);
+int bm_ec_link_peer_released(bm_ec_link *l); /* far modem sent DISC (ATH) */
+int bm_ec_link_phase(bm_ec_link *l);         /* 0 detect, 1 XID, 2 LAPM, 3 transparent */
+int bm_ec_link_compression(bm_ec_link *l);   /* 0 none, 1 V.42bis, 2 V.44 */
+unsigned long long bm_ec_link_damaged_frames(bm_ec_link *l);
+void bm_ec_destroy(bm_ec_link *l);
 
 /* Human-readable start-up phase / failure reason. Pointers are into `a`
    and valid until the next call on it. */

@@ -288,6 +288,7 @@ enum State {
 /// Turns a stuffed bit stream back into frames.
 #[derive(Debug)]
 pub struct Decoder {
+    minimum_payload: usize,
     fcs: Fcs,
     /// Whether a frame that fails the expected width may be tried at the other.
     ///
@@ -319,6 +320,7 @@ pub struct Decoder {
 impl Decoder {
     pub fn new(fcs: Fcs) -> Self {
         Self {
+            minimum_payload: 2,
             fcs,
             either: false,
             matched: fcs,
@@ -336,6 +338,13 @@ impl Decoder {
 
     pub fn with_max_octets(mut self, max: usize) -> Self {
         self.max_octets = max;
+        self
+    }
+
+    /// V.8bis ACK/NAK carry a single information octet, unlike LAPM's
+    /// mandatory address and control. Keep the LAPM minimum by default.
+    pub fn with_minimum_payload(mut self, octets: usize) -> Self {
+        self.minimum_payload=octets.max(1);
         self
     }
 
@@ -459,7 +468,7 @@ impl Decoder {
                 let overlong = self.overlong;
                 // A closing flag may open the next frame (V.42 8.1.1.2).
                 self.enter_frame();
-                let done = Self::finish(bits.clone(), self.fcs, overlong);
+                let done = Self::finish(bits.clone(), self.fcs, overlong,self.minimum_payload);
                 self.matched = self.fcs;
                 // Kept before the other width is tried, since that may succeed
                 // and this is wanted only for the frames that do not.
@@ -476,7 +485,7 @@ impl Decoder {
                         Fcs::Bits16 => Fcs::Bits32,
                         Fcs::Bits32 => Fcs::Bits16,
                     };
-                    if let Some(Ok(frame)) = Self::finish(bits, other, overlong) {
+                    if let Some(Ok(frame)) = Self::finish(bits, other, overlong,self.minimum_payload) {
                         self.matched = other;
                         self.discarded.clear();
                         return Some(Ok(frame));
@@ -514,7 +523,7 @@ impl Decoder {
         self.overlong = false;
     }
 
-    fn finish(bits: Vec<bool>, fcs: Fcs, overlong: bool) -> Option<Result<Vec<u8>, FrameError>> {
+    fn finish(bits: Vec<bool>, fcs: Fcs, overlong: bool,minimum_payload:usize) -> Option<Result<Vec<u8>, FrameError>> {
         // Back-to-back flags leave nothing between them; that is idle fill, not
         // a frame, so say nothing rather than reporting an error.
         if bits.is_empty() {
@@ -528,7 +537,7 @@ impl Decoder {
         }
         let frame = octets(&bits);
         // An address octet, a control octet and the FCS are the minimum.
-        if frame.len() < 2 + fcs.octets() {
+        if frame.len() < minimum_payload + fcs.octets() {
             return Some(Err(FrameError::TooShort));
         }
         if !fcs_ok(&frame, fcs) {
@@ -556,6 +565,20 @@ fn octets(bits: &[bool]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_octet_control_requires_an_explicit_non_lapm_minimum() {
+        let mut enc=Encoder::new(Fcs::Bits16);enc.frame(&[0x14]);
+        let mut normal=Decoder::new(Fcs::Bits16);
+        let mut bis=Decoder::new(Fcs::Bits16).with_minimum_payload(1);
+        let mut normal_result=None;let mut bis_result=None;
+        while let Some(bit)=enc.next_bit() {
+            normal_result=normal.feed(bit).or(normal_result);
+            bis_result=bis.feed(bit).or(bis_result);
+        }
+        assert_eq!(normal_result,Some(Err(FrameError::TooShort)));
+        assert_eq!(bis_result,Some(Ok(vec![0x14])));
+    }
 
     /// Run a payload through the encoder and back through the decoder.
     fn round_trip(payload: &[u8], fcs: Fcs) -> Vec<Result<Vec<u8>, FrameError>> {

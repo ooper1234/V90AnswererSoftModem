@@ -356,3 +356,148 @@ mod async_bits_tests {
         assert_eq!(back.framing_errors(), 1);
     }
 }
+
+/// A bit clock for a synchronous stream carried on a sliced FSK level.
+///
+/// V.42 over Bell 103 sends HDLC frames on the FSK carrier, with no start
+/// bits to re-synchronise on, so the bits have to be taken at a recovered
+/// clock. Each level transition marks a bit boundary; the sampling instant is
+/// pulled halfway towards half a bit after it. Pulling instead of jumping
+/// keeps a noise spike from inserting a bit, and taking the correction modulo
+/// one bit keeps it from ever sampling the same bit twice.
+#[derive(Debug, Clone)]
+pub struct BitClock {
+    sps: f64,
+    t: f64,
+    next: f64,
+    prev: bool,
+}
+
+impl BitClock {
+    pub fn new(baud: f64, fs: f64) -> Self {
+        let sps = fs / baud;
+        Self { sps, t: 0.0, next: sps * 0.5, prev: true }
+    }
+
+    /// One sample of sliced level (`> 0` is mark); a bit when one is due.
+    pub fn feed(&mut self, level: f64) -> Option<bool> {
+        let bit = level > 0.0;
+        self.t += 1.0;
+        if bit != self.prev {
+            let want = self.t + self.sps * 0.5;
+            let mut d = (want - self.next) % self.sps;
+            if d > self.sps * 0.5 { d -= self.sps; }
+            if d < -self.sps * 0.5 { d += self.sps; }
+            // Half a bit off, either way is as near. Going back so far that
+            // the next instant is already past would sample at once and again
+            // within this same bit; go forward instead.
+            if self.next + 0.5 * d <= self.t { d += self.sps; }
+            self.next += 0.5 * d;
+            self.prev = bit;
+        }
+        if self.t >= self.next {
+            self.next += self.sps;
+            return Some(bit);
+        }
+        None
+    }
+
+    pub fn reset(&mut self) {
+        self.t = 0.0;
+        self.next = self.sps * 0.5;
+        self.prev = true;
+    }
+}
+
+#[cfg(test)]
+mod bit_clock_tests {
+    use super::BitClock;
+
+    fn levels(bits: &[bool], sps: f64, noise_at: Option<usize>) -> Vec<f64> {
+        let mut v = Vec::new();
+        let mut t = 0.0f64;
+        for &b in bits {
+            t += sps;
+            while (v.len() as f64) < t { v.push(if b { 1.0 } else { -1.0 }); }
+        }
+        if let Some(n) = noise_at { v[n] = -v[n]; }
+        v
+    }
+
+    fn recover(bits: &[bool], sps: f64, noise_at: Option<usize>) -> Vec<bool> {
+        let mut c = BitClock::new(300.0, 8000.0);
+        levels(bits, sps, noise_at).iter().filter_map(|&l| c.feed(l)).collect()
+    }
+
+    fn pattern() -> Vec<bool> {
+        // Flags, then data with long runs both ways, as HDLC carries.
+        let mut b = Vec::new();
+        for byte in [0x7eu8, 0x7e, 0x00, 0x00, 0xff, 0x3e, 0xa5, 0x7e, 0x13, 0x00, 0x7e] {
+            for i in 0..8 { b.push(byte >> i & 1 != 0); }
+        }
+        b
+    }
+
+    #[test]
+    fn a_synchronous_stream_comes_back_bit_for_bit() {
+        let bits = pattern();
+        assert_eq!(recover(&bits, 8000.0 / 300.0, None), bits);
+    }
+
+    #[test]
+    fn a_far_clock_half_a_percent_fast_is_tracked() {
+        let bits: Vec<bool> = pattern().repeat(20);
+        assert_eq!(recover(&bits, 8000.0 / 301.5, None), bits);
+    }
+
+    /// The discriminator wobbles across zero for a few samples at a slow
+    /// transition, worst at the first start bit after a long idle mark. A
+    /// live Bell 103 call lost its first typed character to that: each wobble
+    /// pulled the clock and the start bit was sampled twice.
+    #[test]
+    fn a_ragged_edge_does_not_sample_a_bit_twice() {
+        let mut bits = vec![true; 300];
+        bits.extend(pattern());
+        let sps = 8000.0 / 300.0;
+        let mut v = levels(&bits, sps, None);
+        // Chatter at every transition: the new level, then the old, for a
+        // few samples before settling.
+        let edges: Vec<usize> = (1..v.len()).filter(|&i| (v[i] > 0.0) != (v[i - 1] > 0.0)).collect();
+        for e in edges {
+            for k in [1usize, 3] {
+                if e + k < v.len() { v[e + k] = -v[e + k]; }
+            }
+        }
+        let mut c = BitClock::new(300.0, 8000.0);
+        let got: Vec<bool> = v.iter().filter_map(|&l| c.feed(l)).collect();
+        assert_eq!(got, bits);
+    }
+
+    /// A start bit after a long idle mark, wherever it falls against the
+    /// free-running clock. A live Bell 103 call lost its first typed
+    /// character when the edge came half a bit from the sampling instant:
+    /// the correction went backwards, sampled at once and again inside the
+    /// same start bit.
+    #[test]
+    fn a_start_bit_after_idle_is_taken_once_wherever_it_falls() {
+        use super::AsyncBits;
+        let framer = AsyncBits::new(8);
+        let sps = 8000.0 / 300.0;
+        for idle in 2600..2680 {
+            let mut v = vec![1.0; idle];
+            let tail = levels(&[framer.encode(b'd'), framer.encode(b'i')].concat(), sps, None);
+            v.extend(tail);
+            v.extend(vec![1.0; 200]);
+            let mut c = BitClock::new(300.0, 8000.0);
+            let mut de = AsyncBits::new(8);
+            let got: Vec<u8> = v.iter().filter_map(|&l| c.feed(l)).filter_map(|b| de.feed(b)).collect();
+            assert_eq!(got, b"di".to_vec(), "idle {idle}");
+        }
+    }
+
+    #[test]
+    fn a_one_sample_spike_neither_adds_nor_drops_a_bit() {
+        let bits = pattern();
+        assert_eq!(recover(&bits, 8000.0 / 300.0, Some(200)), bits);
+    }
+}

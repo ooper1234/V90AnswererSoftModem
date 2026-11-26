@@ -150,6 +150,17 @@ const SILENCE_BEFORE_S: f64 = 0.070;
 /// is better served by more than the least.
 const PHASE3_TRN: f64 = 1.0;
 
+/// How long past a round trip the far end's J goes on arriving once this end's
+/// S has started: the far end has to hear S and finish its J. On the USR
+/// caller's line (2026-11-21, 0.94 s round trip) it ran 30 to 80 ms; a 17 dB
+/// louder J in the echo fit's rows is what wrecked it, so keep well clear.
+const ECHO_FAR_TAIL: f64 = 0.15;
+
+/// How far short of a round trip after this end's J the echo rows stop: the far
+/// end's reply to J cannot arrive sooner, and this covers the round trip
+/// having been measured a little long.
+const ECHO_REPLY_GUARD: f64 = 0.05;
+
 /// The least TRN there is in either phase.
 const LEAST_TRN: usize = 512;
 
@@ -237,6 +248,11 @@ const RETRAIN_TONE_CLEAR: f64 = 6.0;
 /// Below this a retrain's tone is not there at all, however clear it stands.
 const RETRAIN_TONE_AUDIBLE: f64 = 0.008;
 
+/// A far end's retrain tone is about half its loudest arrival (0.21 against
+/// 0.44 on live V.92 calls); a tone under a tenth of that is this end's own
+/// tone A coming back as echo (0.0093 on the same calls, 2026-11-19).
+const RETRAIN_TONE_OF_PEAK: f64 = 0.1;
+
 /// The far end's role, whose tone this end listens for.
 fn far_role(role: Role) -> Role {
     match role {
@@ -257,6 +273,9 @@ pub(crate) struct RetrainWatch {
     /// How loud the tone has to be, once it has stood long enough, to be a
     /// retrain.
     floor: f64,
+    /// How loud the tone has to be given how loud the far end has been
+    /// (see [`Self::far_peak`]).
+    far_floor: f64,
     /// Whether the tone standing now has been taken for a retrain already.
     told: bool,
     /// What the watch decided on when it took a tone: the tone's amplitude,
@@ -283,6 +302,7 @@ impl RetrainWatch {
             above: dsp::ToneDetector::new(freq + 150.0, 10.0, fs),
             held: 0,
             floor: RETRAIN_TONE_AUDIBLE,
+            far_floor: 0.0,
             told: false,
             took: None,
         }
@@ -306,6 +326,12 @@ impl RetrainWatch {
         self
     }
 
+    /// The loudest the far end has arrived: a retrain tone far under it is
+    /// an echo of this end's own (see [`RETRAIN_TONE_OF_PEAK`]).
+    pub(crate) fn far_peak(&mut self, peak: f64) {
+        self.far_floor = if peak.is_finite() { peak * RETRAIN_TONE_OF_PEAK } else { 0.0 };
+    }
+
     /// Hear one sample, and say whether the tone has now stood long enough to
     /// be a retrain.
     ///
@@ -326,7 +352,8 @@ impl RetrainWatch {
             && self.on.amplitude() > RETRAIN_TONE_AUDIBLE;
         self.held = if clear { self.held + 1 } else { 0 };
         self.told &= self.held > 0;
-        let retrain = !self.told && self.held >= (RETRAIN_TONE_HELD * fs) as u64 && self.on.amplitude() > self.floor;
+        let retrain = !self.told && self.held >= (RETRAIN_TONE_HELD * fs) as u64
+            && self.on.amplitude() > self.floor.max(self.far_floor);
         if retrain {
             self.took = Some((
                 self.on.amplitude(),
@@ -783,6 +810,11 @@ pub struct Modem {
     /// Waiting out the far end's MD until this sample.
     md_until: Option<u64>,
     md_waited: bool,
+    /// When this end began sending phase 3's S, and when it moved on to J:
+    /// the far end's silence, as this end hears it, runs from a round trip
+    /// after the first to a round trip after the second.
+    send_from: Option<u64>,
+    j_from: Option<u64>,
     /// Symbols of phase 3's TRN to send.
     trn_symbols: usize,
 
@@ -883,6 +915,9 @@ impl Modem {
             far_mode: far,
             md_until: None,
             md_waited: false,
+            // The answer modem starts here, in its own S (11.3.2.1).
+            send_from: matches!(settings.role, Role::Answer).then_some(0),
+            j_from: None,
             trn_symbols: (PHASE3_TRN * settings.transmit.baud()) as usize,
             far_asked: None,
             phase3_snr: None,
@@ -918,7 +953,7 @@ impl Modem {
         };
         match settings.role {
             Role::Call => {
-                modem.rx.hunt();
+                modem.rx.hunt_full_s();
                 // 11.3.2.1.1: J within 2800 ms and two round trips of INFO1c.
                 modem.deadline = Some((modem.samples(2.8 + 2.0 * settings.round_trip + SLACK), "no J from the answer modem"));
             }
@@ -1218,6 +1253,13 @@ impl Modem {
                 self.stage, stage, self.rx.snr_db(), self.listening.j_prime,
                 self.listening.trn_symbols, self.far_mp);
         }
+        let sending = |s: Stage| matches!(s, Stage::CallSendTraining | Stage::AnswerSendTraining);
+        if sending(stage) && !sending(self.stage) {
+            self.send_from = Some(self.now);
+            self.j_from = None;
+        } else if sending(self.stage) && !sending(stage) {
+            self.j_from = Some(self.now);
+        }
         self.stage = stage;
     }
 
@@ -1285,10 +1327,27 @@ impl Modem {
         std::mem::take(&mut self.wants_retrain)
     }
 
-    /// Phase 3 sends our PP/TRN while the peer waits for our J. The initial
-    /// propagation interval is excluded by the echo fitter's aligned rows.
+    /// Phase 3 sends our S, PP and TRN while the peer waits for our J, and
+    /// the peer stays silent until our J has reached it: what arrives here is
+    /// our own echo until a round trip after J began. That is past the change
+    /// of stage at J, and on a long line most of the silence is: on a 0.94 s
+    /// line with a second of TRN, all but 0.16 s of it.
     pub fn far_end_silent(&self) -> bool {
-        matches!(self.stage, Stage::AnswerSendTraining | Stage::CallSendTraining)
+        match self.stage {
+            Stage::AnswerSendTraining | Stage::CallSendTraining => true,
+            Stage::AnswerAwaitS | Stage::CallAwaitS4 => self.j_from.is_some_and(|from|
+                self.now < from + ((self.rtd() - ECHO_REPLY_GUARD).max(0.0) * self.fs).round() as u64),
+            _ => false,
+        }
+    }
+
+    /// Whether what arrives now is our echo alone: [`Self::far_end_silent`]
+    /// once the far end's J, which it sends until it hears our S, has stopped
+    /// arriving. The rows before that hold its J at full level, and the echo
+    /// fit is to start after them.
+    pub fn far_end_quiet(&self) -> bool {
+        self.far_end_silent() && self.send_from.is_some_and(|from|
+            self.now >= from + ((self.rtd() + ECHO_FAR_TAIL) * self.fs).round() as u64)
     }
 
     /// Ask for a full retrain from data mode (11.5.1.1, 11.5.2.1). False, and
@@ -1640,7 +1699,7 @@ impl Modem {
             && self.now >= until
         {
             self.md_until = None;
-            self.rx.hunt();
+            self.rx.hunt_full_s();
         }
         let baud = self.settings.transmit.baud();
         match self.stage {
@@ -1650,7 +1709,7 @@ impl Modem {
                 }
                 if self.source.segment == Segment::J {
                     // 11.3.2.2.1: S-bar within 600 ms and a round trip of J.
-                    self.rx.hunt();
+                    self.rx.hunt_full_s();
                     self.deadline = Some((self.samples(0.6 + self.rtd() + SLACK), "no S from the call modem"));
                     self.enter(Stage::AnswerAwaitS);
                 }
@@ -1862,6 +1921,34 @@ mod tests {
                 modem.stage = stage;
                 assert!(!modem.far_end_silent(), "peer traffic at {stage:?} must not enter the fit");
             }
+        }
+    }
+
+    #[test]
+    fn echo_rows_run_from_the_far_ends_last_j_to_its_reply_to_ours() {
+        // The USR caller, 2026-11-21, 0.94 s round trip: his J went on
+        // arriving for a round trip after our S started, and his phase 4 S
+        // came a round trip after our J did. The second of his silence lay
+        // across the change of stage at our J, and the fit had been given only
+        // the 0.16 s of it before that, behind the tail of his J.
+        for (role, send, after) in [(Role::Call, Stage::CallSendTraining, Stage::CallAwaitS4),
+                                    (Role::Answer, Stage::AnswerSendTraining, Stage::AnswerAwaitS)] {
+            let rt = 0.94;
+            let mut m = Modem::new(settings(role, rt), FS);
+            let at = |t: f64| (t * FS) as u64;
+            m.enter(send);
+            assert!(m.far_end_silent());
+            m.now = at(rt);
+            assert!(m.far_end_silent() && !m.far_end_quiet(), "{role:?}: his J is still arriving");
+            m.now = at(rt + ECHO_FAR_TAIL + 0.01);
+            assert!(m.far_end_quiet(), "{role:?}");
+            // Our J: he cannot reply to it before it has been there and back.
+            m.now = at(11.2);
+            m.enter(after);
+            m.now = at(11.2 + rt - ECHO_REPLY_GUARD - 0.01);
+            assert!(m.far_end_silent() && m.far_end_quiet(), "{role:?}: still his silence");
+            m.now = at(11.2 + rt - ECHO_REPLY_GUARD + 0.01);
+            assert!(!m.far_end_silent() && !m.far_end_quiet(), "{role:?}: his reply may be here");
         }
     }
 
@@ -2367,6 +2454,35 @@ mod tests {
             assert_eq!(times, 1, "{db} dB down");
             assert_eq!(tone_b_taken(&mut RetrainWatch::new(Role::Call, FS), down(db)).0, Some(at), "{db} dB down");
         }
+    }
+
+    /// Live V.92 calls 25 and 31, 2026-11-19: 84 ms into phase 3 the digital
+    /// modem took a 2400 Hz tone at 0.0093 -- the echo of its own tone A, 27
+    /// dB under the analogue modem's real tone A on the same calls (0.21) --
+    /// for a retrain, with the far end's arrivals peaking at 0.4569. Knowing
+    /// how loud the far end is, the watch lets the echo by and still takes
+    /// the real tone as soon as it would have.
+    #[test]
+    fn our_own_tone_a_echo_is_not_the_far_ends_retrain() {
+        let tone_a_taken = |watch: &mut RetrainWatch, amplitude: f64| {
+            let mut nco = dsp::Nco::new(2400.0, FS);
+            (0..(0.3 * FS) as usize)
+                .position(|_| watch.feed(amplitude * nco.step().1, FS))
+                .map(|i| i as f64 / FS)
+        };
+        let watch = || {
+            let mut w = RetrainWatch::new(Role::Answer, FS);
+            w.far_peak(0.4569);
+            w
+        };
+        assert_eq!(tone_a_taken(&mut watch(), 0.0093), None, "our echo");
+        let at = tone_a_taken(&mut watch(), 0.21).expect("the far end's tone A");
+        assert_eq!(Some(at), tone_a_taken(&mut RetrainWatch::new(Role::Answer, FS), 0.21));
+        assert!(at <= TAKEN_BY);
+        // Nothing heard yet: the watch is as it was.
+        let mut quiet = RetrainWatch::new(Role::Answer, FS);
+        quiet.far_peak(0.0);
+        assert!(tone_a_taken(&mut quiet, 0.0093).is_some());
     }
 
     /// With no level from phase 2 the watch is the one V.34 and the V.90

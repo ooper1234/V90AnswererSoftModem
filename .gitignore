@@ -10,3 +10,9 @@ src/modem/v34/v34build/
 
 scripts/multilink/server.json
 scripts/multilink/client.json
+
+# Local deployment helpers, saved binaries, working notes and backups
+/deploy-*.sh
+/saved-builds/
+/docs/superpowers/
+*.orig
