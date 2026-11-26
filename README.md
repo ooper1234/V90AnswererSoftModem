@@ -13,7 +13,7 @@ reliability depends heavily on the phone line.
 ![Windows XP dialled in at 53.2 kbit/s, browsing Google in RetroZilla](docs/images/windows-xp-dialup-53k.jpg)
 
 *A Windows XP laptop dialled in through this server: connected at 53.2
-kbit/s, browsing the web in RetroZilla.*
+kbit/s.*
 
 ## Modulations
 
