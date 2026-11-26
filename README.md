@@ -10,6 +10,11 @@ It uses the vendored [BinModem](https://github.com/CasualArclamp/BinModem)
 engine. It is experimental: it works on live calls, but long-call
 reliability depends heavily on the phone line.
 
+![Windows XP dialled in at 53.2 kbit/s, browsing Google in RetroZilla](docs/images/windows-xp-dialup-53k.jpg)
+
+*A Windows XP laptop dialled in through this server: connected at 53.2
+kbit/s, browsing the web in RetroZilla.*
+
 ## Modulations
 
 Speeds are the most each mode carries; what a call reaches depends on the
