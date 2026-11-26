@@ -24,7 +24,7 @@ pub const BLOCK: usize = 16;
 
 /// The sync, each block behind its start bit, and the CRC behind one: every
 /// sequence here up to its fill.
-pub(crate) fn frame(information: &[bool]) -> Vec<bool> {
+fn frame(information: &[bool]) -> Vec<bool> {
     debug_assert_eq!(information.len() % BLOCK, 0, "information is whole blocks");
     let mut bits = vec![true; SYNC_ONES];
     for block in information.chunks(BLOCK) {
@@ -39,7 +39,7 @@ pub(crate) fn frame(information: &[bool]) -> Vec<bool> {
 /// The information of a sequence of `blocks` blocks, if the sync, every start
 /// bit and the CRC are what they should be. `bits` starts at the frame sync
 /// and runs at least to the end of the CRC.
-pub(crate) fn unframe(bits: &[bool], blocks: usize) -> Option<Vec<bool>> {
+fn unframe(bits: &[bool], blocks: usize) -> Option<Vec<bool>> {
     let crc_at = SYNC_ONES + blocks * (BLOCK + 1) + 1;
     if bits.len() < crc_at + 16 || !bits[..SYNC_ONES].iter().all(|b| *b) {
         return None;
@@ -57,13 +57,13 @@ pub(crate) fn unframe(bits: &[bool], blocks: usize) -> Option<Vec<bool>> {
     (crc(&information) == get(bits, crc_at, 16) as u16).then_some(information)
 }
 
-pub(crate) fn put(bits: &mut Vec<bool>, value: u32, width: usize) {
+fn put(bits: &mut Vec<bool>, value: u32, width: usize) {
     for i in 0..width {
         bits.push(value >> i & 1 == 1);
     }
 }
 
-pub(crate) fn get(bits: &[bool], from: usize, width: usize) -> u32 {
+fn get(bits: &[bool], from: usize, width: usize) -> u32 {
     (0..width).fold(0, |value, i| value | u32::from(bits[from + i]) << i)
 }
 
@@ -203,18 +203,6 @@ impl Descriptor {
     }
 
     pub fn to_bits(&self) -> Vec<bool> {
-        let mut bits = frame(&self.information());
-        // "Fill bit: 0", and another if it takes one to make the length even.
-        bits.push(false);
-        if bits.len() % 2 == 1 {
-            bits.push(false);
-        }
-        bits
-    }
-
-    /// The whole blocks that go between the frame sync and the CRC. V.92's
-    /// Ja (Table 20) carries these and adds its rate mask behind them.
-    pub(crate) fn information(&self) -> Vec<bool> {
         let n = self.ucodes.len().min(255);
         let (signs, training) = if n == 0 {
             // "LSP - 1 = LTP - 1 = 0 when N = 0."
@@ -245,49 +233,37 @@ impl Descriptor {
         }
         let padded = information.len().div_ceil(BLOCK) * BLOCK;
         information.resize(padded, false);
-        information
-    }
-
-    /// How many information blocks a descriptor starting at its frame sync
-    /// in `bits` has, read from its first two blocks.
-    pub(crate) fn information_blocks(bits: &[bool]) -> Option<usize> {
-        if bits.len() < SYNC_ONES + 2 * (BLOCK + 1) {
-            return None;
+        let mut bits = frame(&information);
+        // "Fill bit: 0", and another if it takes one to make the length even.
+        bits.push(false);
+        if bits.len() % 2 == 1 {
+            bits.push(false);
         }
-        let at = |block: usize, bit: usize| SYNC_ONES + block * (BLOCK + 1) + 1 + bit;
-        let n = get(bits, at(0, 0), 8) as usize;
-        let lsp = get(bits, at(1, 0), 7) as usize + 1;
-        let ltp = get(bits, at(1, 8), 7) as usize + 1;
-        Some(2 + lsp.div_ceil(BLOCK) + ltp.div_ceil(BLOCK) + 8 + n.div_ceil(2))
-    }
-
-    /// A descriptor out of its information blocks.
-    pub(crate) fn from_information(information: &[bool]) -> Option<Self> {
-        if information.len() < 2 * BLOCK {
-            return None;
-        }
-        let n = get(information, 0, 8) as usize;
-        let lsp = get(information, BLOCK, 7) as usize + 1;
-        let ltp = get(information, BLOCK + 8, 7) as usize + 1;
-        let mut from = 2 * BLOCK;
-        if information.len() < (2 + lsp.div_ceil(BLOCK) + ltp.div_ceil(BLOCK) + 8 + n.div_ceil(2)) * BLOCK {
-            return None;
-        }
-        let signs = information[from..from + lsp].to_vec();
-        from += lsp.div_ceil(BLOCK) * BLOCK;
-        let training = information[from..from + ltp].to_vec();
-        from += ltp.div_ceil(BLOCK) * BLOCK;
-        let seven = |k: usize| get(information, from + 8 * k, 7) as u8;
-        let h = std::array::from_fn(&seven);
-        let refs = std::array::from_fn(|c| seven(8 + c));
-        let ucodes = (0..n).map(|k| seven(16 + k)).collect();
-        Some(Self { signs, training, h, refs, ucodes })
+        bits
     }
 
     /// A descriptor out of `bits`, which start at its frame sync.
     pub fn from_bits(bits: &[bool]) -> Option<Self> {
-        let blocks = Self::information_blocks(bits)?;
-        Self::from_information(&unframe(bits, blocks)?)
+        if bits.len() < SYNC_ONES + 2 * (BLOCK + 1) {
+            return None;
+        }
+        // The first two blocks say how long the rest is.
+        let at = |block: usize, bit: usize| SYNC_ONES + block * (BLOCK + 1) + 1 + bit;
+        let n = get(bits, at(0, 0), 8) as usize;
+        let lsp = get(bits, at(1, 0), 7) as usize + 1;
+        let ltp = get(bits, at(1, 8), 7) as usize + 1;
+        let blocks = 2 + lsp.div_ceil(BLOCK) + ltp.div_ceil(BLOCK) + 8 + n.div_ceil(2);
+        let information = unframe(bits, blocks)?;
+        let mut from = 2 * BLOCK;
+        let signs = information[from..from + lsp].to_vec();
+        from += lsp.div_ceil(BLOCK) * BLOCK;
+        let training = information[from..from + ltp].to_vec();
+        from += ltp.div_ceil(BLOCK) * BLOCK;
+        let seven = |k: usize| get(&information, from + 8 * k, 7) as u8;
+        let h = std::array::from_fn(&seven);
+        let refs = std::array::from_fn(|c| seven(8 + c));
+        let ucodes = (0..n).map(|k| seven(16 + k)).collect();
+        Some(Self { signs, training, h, refs, ucodes })
     }
 }
 
@@ -401,19 +377,8 @@ impl Cp {
 
     /// The Ucodes of the constellation data frame interval `i` uses, as the
     /// digital modem is to send them.
-    /// The Ucodes interval `i` sends on.
-    ///
-    /// A set some interval uses, sent empty, is read as the first set. A real
-    /// Conexant did that in a rate renegotiation (2026-11-13): no interval
-    /// can carry anything on no points, and the rate the same CP asked for
-    /// (drn 10, 18 points: 18^6 just over 2^25) fits only with the first set
-    /// there.
     pub fn points(&self, i: usize) -> Vec<u8> {
-        let set = |n: usize| self.constellations.get(n).copied().unwrap_or(0);
-        let mask = match set(usize::from(self.intervals[i])) {
-            0 => set(0),
-            mask => mask,
-        };
+        let mask = self.constellations.get(usize::from(self.intervals[i])).copied().unwrap_or(0);
         (0..UCODES as u8).filter(|&u| mask >> u & 1 == 1).collect()
     }
 
@@ -431,15 +396,54 @@ impl Cp {
         put(&mut information, u32::from(self.upstream_rates), 13);
         put(&mut information, u32::from(self.lookahead), 2);
 
-        self.body().push(&mut information);
+        put(&mut information, u32::from(self.trn1d_ratio), 16);
+        for coefficient in self.shaping {
+            put(&mut information, u32::from(coefficient as u8), 8);
+        }
+        for index in self.intervals {
+            put(&mut information, u32::from(index), 4);
+        }
+        information.push(self.codec.is_some());
+        put(&mut information, 0, 7); // 129:135 reserved
+
+        // "Only the number of different constellations need to be sent", and
+        // how many that is follows from the largest index.
+        let count = usize::from(self.intervals.iter().copied().max().unwrap_or(0)) + 1;
+        let masks = self.constellations.iter().chain(self.codec.iter().flatten());
+        let wanted = if self.codec.is_some() { 2 * count } else { count };
+        for mask in masks.take(wanted) {
+            for chord in 0..8 {
+                put(&mut information, (mask >> (16 * chord)) as u32 & 0xffff, 16);
+            }
+        }
         let mut bits = frame(&information);
         put(&mut bits, 0, 3); // "Fill bits: 000"
         bits
     }
 
     pub fn from_bits(bits: &[bool]) -> Option<Self> {
-        let information = unframe(bits, CpBody::blocks(bits)?)?;
-        let CpBody { trn1d_ratio, shaping, intervals, constellations, codec } = CpBody::read(&information);
+        if bits.len() < SYNC_ONES + CP_HEADER_BLOCKS * (BLOCK + 1) {
+            return None;
+        }
+        let at = |block: usize, bit: usize| SYNC_ONES + block * (BLOCK + 1) + 1 + bit;
+        let intervals: [u8; 6] = std::array::from_fn(|i| {
+            let (block, bit) = if i < 4 { (5, 4 * i) } else { (6, 4 * (i - 4)) };
+            get(bits, at(block, bit), 4) as u8
+        });
+        // "An integer between 0 and 5"; anything else is not a CP.
+        if intervals.iter().any(|&i| i > 5) {
+            return None;
+        }
+        let codec = bits[at(6, 8)];
+        let count = usize::from(*intervals.iter().max().unwrap_or(&0)) + 1;
+        let masks = if codec { 2 * count } else { count };
+        let information = unframe(bits, CP_HEADER_BLOCKS + MASK_BLOCKS * masks)?;
+        let mask = |k: usize| -> Mask {
+            let from = CP_HEADER_BLOCKS * BLOCK + k * MASK_BLOCKS * BLOCK;
+            (0..MASK_BLOCKS).fold(0, |m, chord| m | Mask::from(get(&information, from + chord * BLOCK, 16)) << (16 * chord))
+        };
+        let constellations: Vec<Mask> = (0..count).map(mask).collect();
+        let codec = codec.then(|| (count..2 * count).map(mask).collect());
         Some(Self {
             data_mode: information[1],
             drn: get(&information, 2, 5) as u8,
@@ -454,97 +458,12 @@ impl Cp {
             a_law: information[16],
             upstream_rates: get(&information, 17, 13) as u16,
             lookahead: get(&information, 30, 2) as u8,
-            trn1d_ratio,
-            shaping,
+            trn1d_ratio: get(&information, 32, 16) as u16,
+            shaping: std::array::from_fn(|k| get(&information, 48 + 8 * k, 8) as u8 as i8),
             intervals,
             constellations,
             codec,
         })
-    }
-}
-
-/// What V.90's CP and V.92's CPt/CPu (Table 23) share from their third
-/// block on: bits 52:135 and the constellation masks behind them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CpBody {
-    pub trn1d_ratio: u16,
-    pub shaping: [i8; 4],
-    pub intervals: [u8; 6],
-    pub constellations: Vec<Mask>,
-    pub codec: Option<Vec<Mask>>,
-}
-
-impl CpBody {
-    /// Appends bits 52 on, as information, after the two header blocks.
-    pub(crate) fn push(&self, information: &mut Vec<bool>) {
-        put(information, u32::from(self.trn1d_ratio), 16);
-        for coefficient in self.shaping {
-            put(information, u32::from(coefficient as u8), 8);
-        }
-        for index in self.intervals {
-            put(information, u32::from(index), 4);
-        }
-        information.push(self.codec.is_some());
-        put(information, 0, 7); // 129:135 reserved
-        // "Only the number of different constellations need to be sent", and
-        // how many that is follows from the largest index.
-        let count = usize::from(self.intervals.iter().copied().max().unwrap_or(0)) + 1;
-        let masks = self.constellations.iter().chain(self.codec.iter().flatten());
-        let wanted = if self.codec.is_some() { 2 * count } else { count };
-        for mask in masks.take(wanted) {
-            for chord in 0..8 {
-                put(information, (mask >> (16 * chord)) as u32 & 0xffff, 16);
-            }
-        }
-    }
-
-    /// How many information blocks a CP starting at its frame sync in
-    /// `bits` has; None if an interval names a constellation past 5.
-    pub(crate) fn blocks(bits: &[bool]) -> Option<usize> {
-        if bits.len() < SYNC_ONES + CP_HEADER_BLOCKS * (BLOCK + 1) {
-            return None;
-        }
-        let at = |block: usize, bit: usize| SYNC_ONES + block * (BLOCK + 1) + 1 + bit;
-        let intervals: [u8; 6] = std::array::from_fn(|i| {
-            let (block, bit) = if i < 4 { (5, 4 * i) } else { (6, 4 * (i - 4)) };
-            get(bits, at(block, bit), 4) as u8
-        });
-        // "An integer between 0 and 5"; anything else is not a CP.
-        if intervals.iter().any(|&i| i > 5) {
-            return None;
-        }
-        let count = usize::from(*intervals.iter().max().unwrap_or(&0)) + 1;
-        let masks = if bits[at(6, 8)] { 2 * count } else { count };
-        Some(CP_HEADER_BLOCKS + MASK_BLOCKS * masks)
-    }
-
-    /// The body out of a whole CP's information.
-    pub(crate) fn read(information: &[bool]) -> Self {
-        let intervals: [u8; 6] = std::array::from_fn(|i| get(information, 5 * BLOCK + 4 * i, 4) as u8);
-        let count = usize::from(*intervals.iter().max().unwrap_or(&0)) + 1;
-        let mask = |k: usize| -> Mask {
-            let from = CP_HEADER_BLOCKS * BLOCK + k * MASK_BLOCKS * BLOCK;
-            (0..MASK_BLOCKS).fold(0, |m, chord| m | Mask::from(get(information, from + chord * BLOCK, 16)) << (16 * chord))
-        };
-        Self {
-            trn1d_ratio: get(information, 2 * BLOCK, 16) as u16,
-            shaping: std::array::from_fn(|k| get(information, 3 * BLOCK + 8 * k, 8) as u8 as i8),
-            intervals,
-            constellations: (0..count).map(mask).collect(),
-            codec: information[6 * BLOCK + 8].then(|| (count..2 * count).map(mask).collect()),
-        }
-    }
-}
-
-impl Cp {
-    fn body(&self) -> CpBody {
-        CpBody {
-            trn1d_ratio: self.trn1d_ratio,
-            shaping: self.shaping,
-            intervals: self.intervals,
-            constellations: self.constellations.clone(),
-            codec: self.codec.clone(),
-        }
     }
 }
 

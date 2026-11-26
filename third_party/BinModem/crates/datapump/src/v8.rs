@@ -180,8 +180,6 @@ enum State {
     SendingJm,
     /// The 75 ms of nothing before the chosen modulation starts.
     Handover,
-    /// V.8 8.2.2: silence before continuing without a CM/JM exchange.
-    LegacyHandover,
     Done(Status),
 }
 
@@ -193,8 +191,6 @@ pub struct Modem {
     menu: Menu,
     tx: Bell103Tx,
     rx: Bell103Rx,
-    /// QC1a arrives before echo training; keep its framing independent of CM.
-    quick_rx: Option<Bell103Rx>,
     bits: AsyncBits,
     decoder: Decoder,
     /// The calling modem's ear for the answering tone.
@@ -242,21 +238,6 @@ pub struct Modem {
     cj: usize,
     /// The JM this end answered with, to repeat as it was.
     sent_jm: Option<Menu>,
-    /// Whether this answering modem offers U.S. Robotics x2 to a caller that
-    /// offers V.34 and no PCM (see [`Self::offering_x2`]).
-    x2: bool,
-    /// The sign of the V.21 carrier: an x2 server turns it after each JM.
-    sign: f64,
-    /// A JM has been queued again, and the carrier turns as the first bit
-    /// of its run-in goes out.
-    turn_due: bool,
-    quick_connect: Option<crate::v92::quick_connect::Answerer>,
-    quick_completed: bool,
-    pcm_output: bool,
-    bis: Option<crate::v8bis::Answerer>,
-    /// How long ANSam goes on unanswered: 8.2.2's five seconds, or a V.92
-    /// modem-on-hold's T1 (9.10.2.1).
-    ansam_for: f64,
 }
 
 impl Modem {
@@ -273,7 +254,6 @@ impl Modem {
             rx: Bell103Rx::with_tones(rx_space, rx_mark, fs),
             bits: AsyncBits::new(8),
             decoder: Decoder::new(),
-            quick_rx: None,
             answer: v8::AnswerTone::new(fs),
             ansam_held: 0.0,
             plain_held: 0.0,
@@ -297,25 +277,7 @@ impl Modem {
             outgoing: Vec::new(),
             cj: 0,
             sent_jm: None,
-            x2: false,
-            sign: 1.0,
-            turn_due: false,
-            quick_connect: None,
-            quick_completed: false,
-            pcm_output: false,
-            bis: None,
-            ansam_for: timing::ANSAM,
         }
-    }
-
-    /// V.92 9.10.2.1: the held modem's ANSam. It goes out at once ("within
-    /// 80 ms" of the last MHack) and for T1 rather than 8.2.2's five seconds,
-    /// with the receiver ready for the caller's QC or CM when it comes back.
-    pub fn holding(mut self, seconds: f64) -> Self {
-        assert_eq!(self.role, Role::Answering, "only the answering modem holds with ANSam");
-        self.ansam_for = seconds;
-        self.enter(State::Ansam);
-        self
     }
 
     /// Ask for LAPM in the protocol category (Table 6).
@@ -330,17 +292,6 @@ impl Modem {
     /// LAPM has said so whether or not its ADP survives the line.
     pub fn offering_lapm(mut self) -> Self {
         self.menu.protocol = Protocol::Lapm;
-        self
-    }
-
-    /// As an answering server, offer U.S. Robotics x2 to a caller whose CM
-    /// offers V.34 and no PCM, as an I-modem does it (libv90modem's
-    /// `docs/history/x2-facts.md`, "Phase 1"): the JM carries the caller's
-    /// PSTN access category back with the digital network bit set, and the
-    /// V.21 carrier's sign is turned after each complete JM. A caller that
-    /// offers PCM gets the JM it would have had anyway.
-    pub fn offering_x2(mut self) -> Self {
-        self.x2 = true;
         self
     }
 
@@ -363,47 +314,10 @@ impl Modem {
         self
     }
 
-    /// Opt in to the digital answering side of V.92 short Phase 1.
-    /// This does not advertise PCM upstream or skip Phase 2 probing.
-    pub fn offering_quick_connect(mut self, law: crate::v90::ucode::Law) -> Self {
-        assert_eq!(self.role, Role::Answering);
-        assert!(self.menu.pcm.is_some());
-        self.quick_connect=Some(crate::v92::quick_connect::Answerer::new(self.fs,law,0));
-        self.quick_rx=Some(Bell103Rx::with_tones(LOW.0,LOW.1,self.fs));
-        self
-    }
-
-    /// Exact PCM levels bypass the ordinary V.21 boundary gain.
-    pub fn pcm_output(&self) -> bool { self.pcm_output }
-    pub fn quick_connected(&self) -> bool { self.quick_completed }
-    /// Quick Connect after ANSam (QC1a) only: QC2a inside V.8 bis goes
-    /// unanswered, and V.8 bis gives way to ANSam.
-    pub fn quick_connect_after_ansam_only(mut self)->Self {
-        if let Some(q)=self.quick_connect.as_mut() {q.decline_v8bis_requests();}
-        self
-    }
-    pub fn allowing_delayed_quick_connect_reply(mut self)->Self {
-        if let Some(q)=self.quick_connect.as_mut() {q.allow_delayed_reply();}
-        self
-    }
-    /// Optional V.8bis prelude. A caller which does not respond still reaches
-    /// ordinary V.8; this is distinct from shortened V.92 Phase 1.
-    pub fn offering_v8bis(mut self)->Self {
-        assert_eq!(self.role,Role::Answering);
-        self.bis=Some(crate::v8bis::Answerer::offering(self.fs,self.menu.modulations,
-            self.menu.protocol==Protocol::Lapm,self.menu.pcm.is_some_and(|p|p.digital)));
-        self
-    }
-    pub fn training_role(&self)->Role {self.role}
-    pub fn set_quick_connect_round_trip(&mut self, seconds:f64) {
-        if let Some(q)=self.quick_connect.as_mut() {q.set_round_trip(seconds);}
-    }
-
     /// Which half of a V.90 pair this end is to be, once the menus are
     /// settled: none unless both offered a PCM category and the two make a
     /// pair (9.1.1/V.90).
     pub fn pcm_role(&self) -> Option<PcmRole> {
-        if self.quick_completed { return Some(PcmRole::Digital); }
         let ours = self.menu.pcm?;
         let far = self.far_menu?.pcm?;
         // From the calling end the far menu is the joint one, which carries
@@ -424,8 +338,6 @@ impl Modem {
 
     /// What the procedure is doing, for a scope to show.
     pub fn phase(&self) -> &'static str {
-        if let Some(b)=self.bis.as_ref() {return b.phase();}
-        if let Some(q)=self.quick_connect.as_ref().filter(|q| q.active()) { return q.phase(); }
         match self.state {
             State::Quiet => "quiet",
             State::Listening => "listening for an answer",
@@ -435,7 +347,6 @@ impl Modem {
             State::Ansam => "ANSam",
             State::SendingJm => "JM",
             State::Handover => "handover",
-            State::LegacyHandover => "legacy handover",
             State::Done(_) => "done",
         }
     }
@@ -457,58 +368,10 @@ impl Modem {
 
     /// One sample in, one sample out.
     pub fn step(&mut self, line: f64) -> f64 {
-        self.step_with_handshake_input(line, line)
-    }
-
-    /// V.8bis has a separate receive band and CRC-protected messages.
-    /// An untrained echo canceller must not erase a valid QC1a or QC2a request.
-    /// QC reply tones use this input too; ordinary V.8 and training keep
-    /// using the cancelled signal.
-    pub fn step_with_handshake_input(&mut self, line: f64, handshake_line: f64) -> f64 {
-        if let Some(b)=self.bis.as_mut() {
-            use crate::v8bis::Output;
-            match b.step(handshake_line) {
-                Output::Sample(value)=>return value,
-                Output::Start(role)=> {
-                    let menu=self.menu;
-                    let mut next=Self::new(role,menu.function,menu.modulations,self.fs);
-                    next.menu=menu;
-                    // The MS receiver becomes the answering modem, irrespective
-                    // of which station originally placed the telephone call.
-                    if role==Role::Answering {
-                        next.quick_connect=self.quick_connect.take();
-                        next.quick_rx=self.quick_rx.take();
-                    }
-                    *self=next;
-                }
-                Output::QuickConnect {lapm,ucode}=> {
-                    if let Some(q)=self.quick_connect.as_mut() {
-                        q.request_v8bis(lapm,ucode,self.menu.protocol==Protocol::Lapm);
-                        if q.active() {self.bis=None;return self.quick_step(handshake_line);}
-                    }
-                    self.bis=None;
-                }
-                Output::Fallback=> {self.bis=None;}
-            }
-        }
         let dt = 1.0 / self.fs;
         self.elapsed += dt;
         self.total += dt;
         self.level.process(line.abs());
-        self.pcm_output=false;
-        if self.quick_connect.as_ref().is_some_and(|q| q.active()) {
-            return self.quick_step(handshake_line);
-        }
-
-        if self.state==State::Ansam {
-            if let (Some(rx),Some(q))=(self.quick_rx.as_mut(),self.quick_connect.as_mut()) {
-                let errors=rx.framing_errors();
-                let octet=rx.feed(handshake_line);
-                if rx.framing_errors()!=errors {q.reset_reception();}
-                if let Some(octet)=octet {q.octet(octet,self.menu.protocol==Protocol::Lapm);}
-                if q.active() {return self.quick_step(handshake_line);}
-            }
-        }
 
         self.answer.feed(line);
         // What the detector says at one instant is not a decision. Its
@@ -536,38 +399,8 @@ impl Modem {
             self.heard(octet);
         }
 
-        if self.quick_connect.as_ref().is_some_and(|q| q.active()) {
-            return self.quick_step(handshake_line);
-        }
-
         self.advance();
         self.transmit()
-    }
-
-    fn quick_step(&mut self,line:f64)->f64 {
-        use crate::v92::quick_connect::Output;
-        match self.quick_connect.as_mut().unwrap().step(line) {
-            Output::Sample {value,pcm} => { self.pcm_output=pcm; value }
-            Output::Ready {lapm} => {
-                self.quick_completed=true;
-                self.chosen=Some(Modulation::V34Duplex);
-                self.agreed=if lapm {Protocol::Lapm} else {Protocol::Unstated};
-                self.enter(State::Done(Status::Agreed(Modulation::V34Duplex)));
-                0.0
-            }
-            Output::Restart => {
-                self.decoder=Decoder::new();
-                self.rx=Bell103Rx::with_tones(LOW.0,LOW.1,self.fs);
-                if self.quick_rx.is_some() {
-                    self.quick_rx=Some(Bell103Rx::with_tones(LOW.0,LOW.1,self.fs));
-                }
-                self.last=None; self.last_octets.clear(); self.repeats=0;
-                self.outgoing.clear(); self.sent_jm=None;
-                self.enter(State::Ansam);
-                self.ansam()
-            }
-            Output::Listening => self.ansam(),
-        }
     }
 
     /// An octet came off the line.
@@ -628,17 +461,6 @@ impl Modem {
                 } else {
                     self.last_octets = self.decoder.sequence().to_vec();
                     self.repeats = 1;
-                    // The far end's menu as it arrived, once per distinct one.
-                    // A non-standard facilities octet (tag 0x0f, Table 2/V.8)
-                    // is how a proprietary mode such as x2 would be offered,
-                    // and nothing here parses it, so say when it is there.
-                    let hex: Vec<String> = self.last_octets.iter().map(|o| format!("{o:02x}")).collect();
-                    let nsf = self.last_octets.iter().any(|o| o & 0x1f == 0x0f);
-                    eprintln!(
-                        "V.8 menu heard: {}{}",
-                        hex.join(" "),
-                        if nsf { " (carries a non-standard facilities field)" } else { " (no non-standard facilities field)" }
-                    );
                 }
                 self.last = Some(menu);
             }
@@ -692,10 +514,7 @@ impl Modem {
 
     fn advance(&mut self) {
         // Nobody waits for ever. 8 gives no figure for this, so it is ours.
-        // A held modem's ANSam may go on for T1 (V.92 9.10.2.1), minutes past
-        // the patience an ordinary negotiation is given.
-        let patience = timing::PATIENCE + (self.ansam_for - timing::ANSAM).max(0.0);
-        if self.total > patience && !matches!(self.state, State::Done(_)) {
+        if self.total > timing::PATIENCE && !matches!(self.state, State::Done(_)) {
             self.enter(State::Done(Status::Failed));
             return;
         }
@@ -776,26 +595,12 @@ impl Modem {
                 // sequences, the DCE shall transmit JM".
                 if let Some(cm) = self.settled() {
                     self.far_menu = Some(cm);
-                    let mut jm = match (self.menu.pcm, self.menu.access) {
+                    let jm = match (self.menu.pcm, self.menu.access) {
                         (Some(pcm), access) => {
                             cm.joint_pcm(self.menu.modulations, self.menu.protocol, pcm, access.unwrap_or_default())
                         }
                         _ => cm.joint(self.menu.modulations, self.menu.protocol),
                     };
-                    // Our V.23 engine carries transparent asynchronous bytes.
-                    // Do not leave its peer waiting for a LAPM exchange that
-                    // this selected engine cannot supply.
-                    if jm.chosen()==Some(Modulation::V23Duplex) {
-                        jm.protocol=Protocol::Unstated;
-                    }
-                    // An x2 server's JM: the CM's PSTN access octet back, with
-                    // "DCE on digital network" set (an I-modem's `... 8d` to a
-                    // Courier's `... 0d`).
-                    if let Some(access) = cm.access
-                        && self.x2 && cm.pcm.is_none()
-                    {
-                        jm.access = Some(v8::Access { digital: true, ..access });
-                    }
                     self.sent_jm = Some(jm);
                     self.chosen = jm.chosen();
                     self.agreed = jm.protocol;
@@ -805,11 +610,10 @@ impl Modem {
                     let octets = v8::sequence(Signal::Jm, &jm);
                     self.send_sequence(octets);
                     self.enter(State::SendingJm);
-                } else if self.elapsed >= self.ansam_for {
+                } else if self.elapsed >= timing::ANSAM {
                     // "If neither CM nor a suitable sigC is detected during
                     // ANSam transmission" the call goes on without V.8.
-                    self.tx.set_transmitting(false);
-                    self.enter(State::LegacyHandover);
+                    self.enter(State::Done(Status::NoNegotiation));
                 }
             }
 
@@ -823,9 +627,6 @@ impl Modem {
                     self.tx.set_transmitting(false);
                     self.enter(State::Handover);
                 } else if self.outgoing.is_empty() && self.tx.pending_bits() == 0 {
-                    // The last bit of a JM has only just begun here: the turn
-                    // waits for the next JM's first bit (see `transmit`).
-                    self.turn_due = self.x2 && self.sent_jm.is_some_and(|jm| jm.pcm.is_none());
                     let jm = self.last_jm();
                     self.send_sequence(jm);
                 }
@@ -841,12 +642,6 @@ impl Modem {
                         // have now said so to each other.
                         None => Status::Failed,
                     }));
-                }
-            }
-
-            State::LegacyHandover => {
-                if self.elapsed >= timing::HANDOVER {
-                    self.enter(State::Done(Status::NoNegotiation));
                 }
             }
 
@@ -889,16 +684,7 @@ impl Modem {
             let bits = self.bits.encode(octet);
             self.tx.push_bits(&bits);
         }
-        // An x2 server's JM: the carrier turns half way round between one
-        // whole JM and the next, on the bit boundary -- as the next JM's first
-        // run-in bit begins, and not as the last stop bit does. A Courier's
-        // V.8 classifier did not take the signature one bit early (the
-        // emulated Courier's x2 flags stayed clear, 2026-11-24).
-        if self.turn_due && self.tx.pending_bits() < v8::PREAMBLE_ONES {
-            self.turn_due = false;
-            self.sign = -self.sign;
-        }
-        self.sign * self.tx.next_sample()
+        self.tx.next_sample()
     }
 
     /// One sample of ANSam (7.2).
@@ -1028,30 +814,6 @@ mod tests {
     /// every code reserved for future definition: `a9` has a tag Table 2 does
     /// not give and vanishes, and `10` is an extension octet with no
     /// modulation bit set. Both leave the same menu.
-    /// V.92 9.10.2.1: the held modem sends ANSam at once and keeps it up for
-    /// T1, where an ordinary answer gives up on it after five seconds.
-    #[test]
-    fn a_held_modem_sends_ansam_at_once_and_for_its_whole_hold() {
-        // T1 of four minutes: past V.8's own sixty seconds of patience.
-        let mut held = Modem::new(Role::Answering, CallFunction::Data, all(), FS).holding(240.0);
-        let first = (0..(0.020 * FS) as usize).map(|_| held.step(0.0).abs()).fold(0.0, f64::max);
-        assert!(first > 0.01, "ANSam must start within 80 ms of the last MHack, heard peak {first}");
-        for _ in 0..(200.0 * FS) as usize {
-            held.step(0.0);
-        }
-        assert_eq!(held.phase(), "ANSam", "still holding 200 s in");
-        assert_eq!(held.status(), Status::Negotiating);
-        for _ in 0..(41.0 * FS) as usize {
-            held.step(0.0);
-        }
-        assert_ne!(held.phase(), "ANSam", "T1 is over");
-        let mut plain = Modem::new(Role::Answering, CallFunction::Data, all(), FS);
-        for _ in 0..(7.0 * FS) as usize {
-            plain.step(0.0);
-        }
-        assert_ne!(plain.phase(), "ANSam", "an ordinary answer stops ANSam after 5 s");
-    }
-
     #[test]
     fn a_menu_is_believed_on_its_octets_and_not_on_what_they_parse_to() {
         let (heard, torn) = menus_at_an_answerer(&[
@@ -1228,37 +990,6 @@ mod tests {
         let (calling, answering) = negotiate(all(), all(), 12.0);
         assert_eq!(calling, Status::Agreed(Modulation::V32bis));
         assert_eq!(answering, Status::Agreed(Modulation::V32bis));
-    }
-
-    #[test]
-    fn v23_joint_menu_selects_transparent_protocol_at_both_ends() {
-        let modes=Modulations::of(&[Modulation::V23Duplex]);
-        let mut c=Modem::new(Role::Calling,CallFunction::Data,modes,FS).offering_lapm();
-        let mut a=Modem::new(Role::Answering,CallFunction::Data,modes,FS).offering_lapm();
-        let (mut ci,mut ai)=(0.0,0.0);
-        for _ in 0..(12.0*FS) as usize {
-            let ct=c.step(ci);let at=a.step(ai);ci=at;ai=ct;
-        }
-        assert_eq!(c.status(),Status::Agreed(Modulation::V23Duplex));
-        assert_eq!(a.status(),Status::Agreed(Modulation::V23Duplex));
-        assert!(!c.lapm()&&!a.lapm());
-    }
-
-    #[test]
-    fn unanswered_ansam_has_a_silent_interval_before_legacy_training() {
-        let mut answering = Modem::new(Role::Answering, CallFunction::Data, all(), FS);
-        answering.enter(State::Ansam);
-        answering.elapsed = timing::ANSAM;
-        answering.advance();
-        assert_eq!(answering.state, State::LegacyHandover);
-        for _ in 0..(FS * 0.070) as usize {
-            assert_eq!(answering.step(0.0), 0.0);
-            assert_eq!(answering.status(), Status::Negotiating);
-        }
-        for _ in 0..(FS * 0.006) as usize {
-            assert_eq!(answering.step(0.0), 0.0);
-        }
-        assert_eq!(answering.status(), Status::NoNegotiation);
     }
 
     #[test]

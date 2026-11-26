@@ -80,20 +80,6 @@ const LEADING_FLAGS: usize = 16;
 /// window is swallowed whole.
 const XID_N400: u32 = 1;
 
-/// How long an answerer whose detection phase timed out goes on listening
-/// for the far end's XID or SABME anyway. A caller that skips the detection
-/// phase and goes straight to XID (V.42 since 2002 no longer has one) does so
-/// in the first second of data mode, which is exactly when a receiver still
-/// settling garbles it; it then retransmits for N400 x T401, typically ten
-/// seconds or more, to an end that had stopped listening and left the whole
-/// call without error control. Only a frame whose FCS checks counts, so
-/// nothing a caller types can be taken for one.
-const LATE_LAPM_WATCH_MS: u32 = 30_000;
-
-/// How many T401 periods an answerer offering V.44 only when asked waits for
-/// the originator's XID before sending its own ([`Stack::v44_when_offered`]).
-const XID_HOLD_T401S: u32 = 2;
-
 /// What the exchange waits after its last XID command, in place of the T401
 /// 8.10.3 would restart: one round trip, and this where the line was never
 /// measured.
@@ -153,12 +139,6 @@ const XID_LAST_WAIT_MS: u32 = crate::lapm::PROPAGATION_MS;
 /// recovery left, and a link carrying nothing readable is better put down.
 pub const UNDECODABLE_RESETS: u64 = 3;
 
-/// How many times in a row an established link that ran out of
-/// retransmissions is established again before it is left down: enough to
-/// ride out a retrain or two, not so many that a far end that has really gone
-/// is called after for the rest of the call.
-pub const REESTABLISHMENTS: u32 = 3;
-
 /// Where a V.42 connection has got to.
 ///
 /// The three stages are separate because they answer separate questions, in
@@ -213,8 +193,6 @@ pub struct Stack {
     /// Compression, when it has been agreed. V.42bis is optional and a
     /// connection without it is a perfectly ordinary V.42 connection.
     compression: Option<Compressor>,
-    /// Kept here rather than in the compressor, which a later XID replaces.
-    counts: CompressionCounts,
     /// Data ready for the terminal.
     delivered: Vec<u8>,
     /// Frames that arrived but could not be read, which is the measure of how
@@ -232,10 +210,6 @@ pub struct Stack {
     /// Whether following an unnegotiated switch was tried and failed, so that
     /// it is tried once and not on every frame for the rest of the call.
     guessed_wrong: bool,
-    /// Decoders for every V.42bis parameter pair the far end could have
-    /// settled on without this end hearing which, while the stream has not
-    /// yet said ([`crate::guess`]).
-    guess: Option<crate::guess::Guess>,
     /// Ceilings on the V.42bis parameters, if the terminal set any.
     ///
     /// Ceilings twice over: what goes into XID, and then 6.4 takes the lower
@@ -245,12 +219,7 @@ pub struct Stack {
     declared: bool,
     /// Whether V.44 is offered alongside V.42bis, and V.42bis alongside V.44.
     offer_v44: bool,
-    /// The information field offered to receive, where not V.42's 128.
-    offer_n401_receive: Option<u16>,
     offer_v42bis: bool,
-    /// Whether V.44 goes into this end's own XID command only once the far
-    /// end's command has offered it ([`Stack::v44_when_offered`]).
-    v44_when_offered: bool,
     /// Ceilings on the V.44 parameters this end proposes, transmit and
     /// receive, if the terminal set any (V.250 Table 28).
     v44_limits: Option<(v44::Params, v44::Params)>,
@@ -266,12 +235,6 @@ pub struct Stack {
     heard_adp: Option<Answer>,
     /// What the far end proposed in XID, if it sent one.
     heard_xid: Option<Xid>,
-    /// V.42 9.2.3 and 9.2.4: the frame sizes and windows settled by this
-    /// end's answer to the far end's XID command, and by the far end's answer
-    /// to this end's. Both are sent here, so both may be there; what goes out
-    /// keeps within both.
-    answered_limits: Option<crate::xid::Limits>,
-    replied_limits: Option<crate::xid::Limits>,
     /// The check sequence width the two ends agreed on, once they have.
     ///
     /// Not in use yet when it is set: V.42 8.10.2 keeps XID at 16 bits and
@@ -280,13 +243,6 @@ pub struct Stack {
     /// Whether the link has ever been up, which is what tells a failure to
     /// establish apart from a connection that later ended.
     established: bool,
-    /// The N400 this stack was made with. Establishment at a far end only V.8
-    /// vouched for runs on Appendix III.2's smaller count; once the link is up
-    /// the far end has shown it does LAPM and this one applies again.
-    n400: u32,
-    /// Re-establishments since the link was last up, after it ran out of
-    /// retransmissions -- see [`REESTABLISHMENTS`].
-    reestablishments: u32,
     /// Compressed streams that would not decode. Each re-established the
     /// link, up to [`UNDECODABLE_RESETS`], and the one after that released it.
     ///
@@ -298,9 +254,6 @@ pub struct Stack {
     undecodable: u64,
     /// Whether establishment was tried and nothing answered.
     gave_up: bool,
-    /// Whether the far end released an established link with DISC: what a
-    /// modem sends on ATH (V.42 8.3.3), so the call is over.
-    peer_released: bool,
     /// Whether the run of flags that opens the protocol phase has been queued.
     opened: bool,
     /// The XID exchange's own copy of the machinery in 8.10.2 and 8.10.3: an
@@ -309,21 +262,12 @@ pub struct Stack {
     xid_due: bool,
     xid_ms: u32,
     xid_retries: u32,
-    /// This end's own XID command went out without V.44 (the far end had not
-    /// offered it yet). The far end answers that command about V.42bis, so
-    /// the answer to its command must come to V.42bis too: two exchanges that
-    /// crossed and settled differently leave each end running a different
-    /// compressor, and a real V.92 modem resets the link on every I frame.
-    commanded_without_v44: bool,
     /// How long the line takes there and back, where the data pump has said.
     /// Zero where nothing has measured it.
     round_trip_ms: u32,
     /// Whether the far end turned out to be talking to this end's terminal
     /// rather than doing V.42.
     heard_text: bool,
-    /// Time left to notice a far end that turns out to do LAPM after all
-    /// ([`LATE_LAPM_WATCH_MS`]); zero when not watching.
-    late_watch_ms: u32,
     /// What the line brought that nothing here claimed: the detection phase's
     /// bits once it has failed, and every bit after, for the terminal
     /// (Appendix I.3's second option).
@@ -385,20 +329,6 @@ struct Lzjh {
     /// peer decoder agree while this end's own pair need not.
     transmit: v44::Params,
     receive: v44::Params,
-}
-
-/// Bytes through the compressor this call, both ways (see
-/// [`Stack::compression_counts`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CompressionCounts {
-    /// Handed to the compressor to send.
-    pub plain_out: u64,
-    /// What it made of them, on the line.
-    pub wire_out: u64,
-    /// Compressed data that arrived and decoded.
-    pub wire_in: u64,
-    /// What that came to.
-    pub plain_in: u64,
 }
 
 #[derive(Debug)]
@@ -484,7 +414,6 @@ impl Stack {
             encoder: Encoder::new(Fcs::Bits16),
             decoder: Decoder::new(Fcs::Bits16),
             compression: None,
-            counts: CompressionCounts::default(),
             delivered: Vec::new(),
             damaged: 0,
             valid_frames: 0,
@@ -495,33 +424,23 @@ impl Stack {
             offer: Compression::Neither,
             limits: (v42bis::OFFERED_N2, v42bis::OFFERED_N7),
             guessed_wrong: false,
-            guess: None,
             declared: false,
             offer_v44: true,
-            offer_n401_receive: None,
-            v44_when_offered: false,
             offer_v42bis: true,
             v44_limits: None,
             declining: false,
             heard_adp: None,
             heard_xid: None,
-            answered_limits: None,
-            replied_limits: None,
             agreed_fcs: Fcs::Bits16,
             established: false,
-            n400: params.n400,
-            reestablishments: 0,
             undecodable: 0,
             gave_up: false,
-            peer_released: false,
             opened: false,
             xid_due: false,
             xid_ms: 0,
             xid_retries: 0,
-            commanded_without_v44: false,
             round_trip_ms: 0,
             heard_text: false,
-            late_watch_ms: 0,
             unclaimed: Vec::new(),
         }
     }
@@ -635,46 +554,6 @@ impl Stack {
         self.offer_v44 = false;
     }
 
-    /// Offer V.44 only to a far end that offers it first.
-    ///
-    /// Some V.42bis-era modems repeat their XID for ever when an XID carries
-    /// the V.44 user data subfield, rather than skipping it as V.42 asks. So
-    /// this end's own XID command leaves V.44 out until the far end's command
-    /// has named it, and an answerer holds its command back for up to two T401
-    /// periods to hear the originator's first. Two, because the originator's
-    /// first XID often reaches this end while it is still in the detection
-    /// phase and is consumed there; its retransmission comes one T401 later. The answer to a command still names V.44
-    /// when both ends offered it (V.44 7.3), so a V.44 modem gets V.44 and an
-    /// older one never sees the subfield at all.
-    pub fn v44_when_offered(&mut self) {
-        self.offer_v44 = true;
-        self.v44_when_offered = true;
-    }
-
-    /// The far end's XID command offered V.44.
-    fn far_end_offered_v44(&self) -> bool {
-        self.heard_xid.as_ref().is_some_and(|x| x.v44.is_some())
-    }
-
-    /// What goes into this end's own XID command.
-    fn command_proposal(&self) -> Xid {
-        let mut xid = self.proposal();
-        if self.v44_when_offered && !self.far_end_offered_v44() {
-            xid.v44 = None;
-        }
-        xid
-    }
-
-    /// Whether an answerer is still giving the originator's XID the chance to
-    /// arrive before sending its own ([`Stack::v44_when_offered`]).
-    fn holding_xid_for_far_end(&self) -> bool {
-        self.v44_when_offered
-            && self.role == Role::Answerer
-            && self.heard_xid.is_none()
-            && self.xid_retries == 0
-            && self.xid_ms < XID_HOLD_T401S * self.lapm.t401_ms()
-    }
-
     /// Do not offer V.42bis, leaving V.44.
     ///
     /// The XID still carries V.42bis's group, saying no direction: a far end
@@ -703,9 +582,6 @@ impl Stack {
     /// What to put in an XID: the standing proposal, capped by the terminal.
     fn proposal(&self) -> Xid {
         let mut xid = Xid::proposal(self.offer);
-        if let Some(n) = self.offer_n401_receive {
-            xid.n401_receive = Some(n);
-        }
         xid.codewords = Some(self.limits.0.min(v42bis::OFFERED_N2));
         xid.max_string = Some(self.limits.1.min(v42bis::OFFERED_N7));
         if !self.offer_v42bis {
@@ -731,8 +607,6 @@ impl Stack {
     }
 
     fn enable_compression(&mut self, params: v42bis::Params) {
-        // An exchange that settled it after all ends the guessing.
-        self.guess = None;
         // Retried XID exchanges do not establish a new data link. Preserve
         // the dictionaries that outstanding I frames still depend on.
         // Actual link establishment/reset reinitializes them in drain().
@@ -752,8 +626,6 @@ impl Stack {
 
     /// The same, for the newer one.
     fn enable_v44(&mut self, transmit: v44::Params, receive: v44::Params) {
-        // An exchange that settled it after all ends the guessing.
-        self.guess = None;
         if self.compression.as_ref().is_some_and(|c| !c.speculative
             && matches!(&c.codec, Codec::V44(b) if b.transmit == transmit && b.receive == receive)) {
             return;
@@ -769,69 +641,9 @@ impl Stack {
         });
     }
 
-    /// What the compressor has taken and made this call, once one has been
-    /// agreed; `None` while nothing compresses.
-    pub fn compression_counts(&self) -> Option<CompressionCounts> {
-        self.compression.as_ref().map(|_| self.counts)
-    }
-
     /// Which compression is running, if any.
     pub fn compression_name(&self) -> Option<&'static str> {
-        match (&self.compression, &self.guess) {
-            (Some(c), _) => Some(c.name()),
-            (None, Some(g)) if g.following() => Some("V.42bis"),
-            _ => None,
-        }
-    }
-
-    /// The V.42bis parameter pairs the far end could be using without this
-    /// end having heard which: the defaults (6.4), for a far end that never
-    /// heard this end's offer; the usual figures modems propose, for one that
-    /// heard it and took the lower of the two; and the offer itself.
-    ///
-    /// A chain, each pair at least the one before in both N2 and N7, because
-    /// that is what lets [`crate::guess`] take the smallest survivor: a
-    /// decoder smaller than the far end's runs out of entries and fails, and
-    /// only the larger ones go on silently. Two pairs each larger in one
-    /// figure, such as 1024/6 and 512/32, can both go on silently, and then
-    /// there is no telling them apart.
-    fn guesses(&self) -> Vec<v42bis::Params> {
-        let proposed = self.proposal();
-        let offer = v42bis::Params {
-            n2: proposed.codewords.unwrap_or(v42bis::OFFERED_N2),
-            n7: proposed.max_string.unwrap_or(v42bis::OFFERED_N7),
-        };
-        [(v42bis::DEFAULT_N2, v42bis::DEFAULT_N7), (1024, 32), (2048, 32)]
-            .into_iter()
-            .map(|(n2, n7)| v42bis::Params { n2, n7 })
-            .filter(|p| p.n2 <= offer.n2 && p.n7 <= offer.n7)
-            .chain([offer])
-            .collect()
-    }
-
-    /// Act on what the guess made of the stream. True when it failed.
-    fn follow(&mut self, verdict: crate::guess::Verdict) -> bool {
-        use crate::guess::Verdict;
-        match verdict {
-            Verdict::Undecided => false,
-            Verdict::Settled(params, decoder) => {
-                self.guess = None;
-                self.compression = Some(Compressor {
-                    codec: Codec::V42bis(Box::new(Btlz {
-                        encoder: v42bis::Encoder::new(params),
-                        decoder,
-                        params,
-                    })),
-                    speculative: true,
-                });
-                false
-            }
-            Verdict::Failed => {
-                self.guess = None;
-                self.guessed_wrong = true;
-                true
-            }
-        }
+        self.compression.as_ref().map(Compressor::name)
     }
 
     /// Whether an unnegotiated switch to compressed data should be followed.
@@ -907,13 +719,6 @@ impl Stack {
         self.encoder.fcs()
     }
 
-    /// Whether the far end has acknowledged every byte sent so far. The
-    /// transmitter never runs dry while the link is up (flags fill the
-    /// gaps), so this, not its queue, says the data is out.
-    pub fn all_acknowledged(&self) -> bool {
-        self.lapm.all_acknowledged()
-    }
-
     /// Bytes handed down and not yet framed for the line.
     pub fn queued(&self) -> usize {
         self.lapm.queued()
@@ -936,52 +741,10 @@ impl Stack {
         self.lapm.is_connected()
     }
 
-    /// Whether the far end released the established link (DISC) and has not
-    /// brought it back since.
-    pub fn peer_released(&self) -> bool {
-        self.peer_released
-    }
-
     pub fn stalled_transmit_ms(&self) -> Option<u32> {
         self.lapm.stalled_transmit_ms()
     }
 
-    /// How long since the peer last showed it hears us (see `Lapm::unheard_ms`).
-    pub fn unheard_ms(&self) -> Option<u32> {
-        self.lapm.unheard_ms()
-    }
-
-    /// Poll the peer now (see `Lapm::probe`).
-    pub fn probe(&mut self) {
-        self.lapm.probe();
-    }
-
-
-    /// Offer to receive information fields of up to `n` octets.
-    pub fn receiving_n401(mut self, n: u16) -> Self {
-        self.offer_n401_receive = Some(n);
-        self
-    }
-
-    /// Start or stop recording the LAPM trace (frames out, N(R)s in).
-    pub fn set_lapm_trace(&mut self, on: bool) {
-        self.lapm.trace = on.then(Vec::new);
-    }
-
-    /// The LAPM trace lines recorded since the last call.
-    pub fn take_lapm_trace(&mut self) -> Vec<String> {
-        self.lapm.trace.as_mut().map(std::mem::take).unwrap_or_default()
-    }
-
-    /// The far end's XID, once one has been read.
-    pub fn heard_xid(&self) -> Option<&Xid> {
-        self.heard_xid.as_ref()
-    }
-
-    /// The longest information field and the window this end sends with.
-    pub fn send_limits(&self) -> (usize, u8) {
-        self.lapm.send_limits()
-    }
 
     /// Intact, decodable LAPM frames, including supervisory traffic.
     pub fn valid_frames(&self) -> u64 {
@@ -1038,10 +801,6 @@ impl Stack {
 
     /// Time passing, which is what drives every timer here.
     pub fn tick(&mut self, dt_ms: u32) {
-        if let Some(guess) = self.guess.as_mut() {
-            let verdict = guess.tick(dt_ms, &mut self.delivered);
-            self.follow(verdict);
-        }
         match self.phase {
             Phase::Detecting => {
                 let outcome = match &mut self.detect {
@@ -1092,10 +851,7 @@ impl Stack {
                     }
                 }
             }
-            Phase::Transparent => {
-                self.late_watch_ms = self.late_watch_ms.saturating_sub(dt_ms);
-            }
-            Phase::Protocol => {}
+            Phase::Protocol | Phase::Transparent => {}
         }
         self.lapm.tick(dt_ms);
         self.drain();
@@ -1113,8 +869,6 @@ impl Stack {
             Some(c) if c.speculative => self.lapm.send_data(data),
             Some(c) => {
                 let out = c.encode(data);
-                self.counts.plain_out += data.len() as u64;
-                self.counts.wire_out += out.len() as u64;
                 self.lapm.send_data(&out);
             }
             None => self.lapm.send_data(data),
@@ -1152,7 +906,7 @@ impl Stack {
                 self.encoder.idle(LEADING_FLAGS);
                 return self.encoder.next_bit().unwrap_or(true);
             }
-            if self.phase == Phase::Negotiating && self.xid_due && !self.holding_xid_for_far_end() {
+            if self.phase == Phase::Negotiating && self.xid_due {
                 // One of them, and then only when T401 says so. 8.10.2 has the
                 // entity "transmit an XID command frame", singular, and then
                 // start T401 and reset N400; 8.10.3 is the only thing that
@@ -1174,13 +928,9 @@ impl Stack {
                 // P/F bit of an XID frame is set to 0" and names no exception.
                 self.xid_due = false;
                 self.xid_ms = 0;
-                let command = self.command_proposal();
-                if command.v44.is_none() {
-                    self.commanded_without_v44 = true;
-                }
                 let body = Frame::Xid {
                     pf: false,
-                    info: command.encode(Kind::Command),
+                    info: self.proposal().encode(Kind::Command),
                 }
                 .encode(DLCI_DATA, self.role, Kind::Command);
                 self.encoder.frame_with(&body, Fcs::Bits16);
@@ -1216,9 +966,6 @@ impl Stack {
         }
         if self.phase == Phase::Transparent {
             self.unclaimed.push(bit);
-            if self.late_watch_ms > 0 {
-                self.watch_for_late_lapm(bit);
-            }
             return;
         }
         let Some(result) = self.decoder.feed(bit) else {
@@ -1241,41 +988,6 @@ impl Stack {
         };
         self.valid_frames += 1;
         if matches!(frame, Frame::I { .. }) { self.valid_information_frames += 1; }
-        self.dispatch(address, frame);
-    }
-
-    /// After a detection phase that timed out: a far end that was doing LAPM
-    /// all along, whose first frames this end did not hear.
-    fn watch_for_late_lapm(&mut self, bit: bool) {
-        let Some(Ok(body)) = self.decoder.feed(bit) else {
-            return;
-        };
-        let Ok((address, frame)) = Frame::decode(&body, self.role) else {
-            return;
-        };
-        if address.kind != Kind::Command {
-            return;
-        }
-        let sabme = matches!(frame, Frame::Sabme { .. });
-        if !sabme && !matches!(frame, Frame::Xid { .. }) {
-            return;
-        }
-        // The bits that carried it were never characters for the terminal,
-        // and what was there before them was this same far end's protocol
-        // garbled; the terminal starts afresh with the link.
-        self.unclaimed.clear();
-        self.late_watch_ms = 0;
-        self.note(false, true, &body);
-        self.valid_frames += 1;
-        if sabme {
-            // Its XID exchange is over (it gave up waiting for an answer and
-            // went on, as 8.10.3 lets it): set the link up as it asks.
-            self.detect = Detect::Done;
-            self.begin_protocol();
-        } else {
-            self.enter_negotiating();
-            self.lapm.set_retransmissions(crate::lapm::UNCONFIRMED_N400);
-        }
         self.dispatch(address, frame);
     }
 
@@ -1310,34 +1022,7 @@ impl Stack {
             return;
         };
         self.heard_xid = Some(theirs);
-        let mut ours = self.proposal();
-        if self.commanded_without_v44 {
-            // The two exchanges crossed: keep them to one answer (V.42bis).
-            ours.v44 = None;
-        }
-        let agreed = ours.resolve(&theirs);
-        // The values used are the responder's (9.2.3, 9.2.4), each read for
-        // its own direction (Table 11a Note 2): this end's, when it answers a
-        // command; the far end's, when this is its answer to ours.
-        if kind == Kind::Command {
-            self.answered_limits = Some(ours.answer_limits(&theirs));
-        } else {
-            self.replied_limits = Some(ours.reply_limits(&theirs));
-        }
-        let (n401, k) = [self.answered_limits, self.replied_limits]
-            .into_iter()
-            .flatten()
-            .fold((u16::MAX, u8::MAX), |(n, k), l| (n.min(l.n401_transmit), k.min(l.window_transmit)));
-        self.lapm.set_send_limits(usize::from(n401), k);
-        // The far end's window towards this end: held against when a frame is
-        // missing, so the larger of the two where both exchanges ran.
-        let k_in = [self.answered_limits, self.replied_limits]
-            .into_iter()
-            .flatten()
-            .map(|l| l.window_receive)
-            .max()
-            .unwrap_or(crate::lapm::DEFAULT_K);
-        self.lapm.set_receive_window(k_in);
+        let agreed = self.proposal().resolve(&theirs);
         // V.44 first where both were offered and both ends know it, and
         // V.42bis otherwise. 7.3 has the responder answer about at most one of
         // the two, so a far end that named neither leaves this alone and the
@@ -1385,7 +1070,7 @@ impl Stack {
             // and the same choice made a few lines above.
             let body = Frame::Xid {
                 pf: false,
-                info: ours.answering(&agreed).encode(Kind::Response),
+                info: self.proposal().answering(&agreed).encode(Kind::Response),
             }
             .encode(DLCI_DATA, self.role, Kind::Response);
             // 8.10.2 keeps this one at 16 bits whatever the connection has
@@ -1459,12 +1144,6 @@ impl Stack {
                 // recognised the question. Either way there is nothing to
                 // establish, and the connection carries on without it.
                 self.detect_failed();
-                // Silence is not a refusal, though: an answerer that heard
-                // nothing keeps listening for a while in case the far end
-                // was talking protocol all along.
-                if outcome == Outcome::TimedOut && self.role == Role::Answerer {
-                    self.late_watch_ms = LATE_LAPM_WATCH_MS;
-                }
             }
         }
     }
@@ -1480,7 +1159,6 @@ impl Stack {
         self.xid_due = true;
         self.xid_ms = 0;
         self.xid_retries = 0;
-        self.commanded_without_v44 = false;
     }
 
     /// No error control: the connection goes on without it, and what the
@@ -1531,17 +1209,9 @@ impl Stack {
                 // stays up carrying nonsense.
                 Event::Connected => {
                     self.established = true;
-                    self.peer_released = false;
-                    self.reestablishments = 0;
-                    // The small count was for a far end that might not do
-                    // LAPM. It does: a retrain must not now cost the link.
-                    self.lapm.set_retransmissions(self.n400);
                     if let Some(compression) = self.compression.as_mut() {
                         self.lapm.discard_pending();
                         compression.reinitialize();
-                    }
-                    if let Some(guess) = self.guess.as_mut() {
-                        guess.reinitialize();
                     }
                 }
                 // The far end re-established under us: 8.2.4.3 discards what
@@ -1551,20 +1221,6 @@ impl Stack {
                     if let Some(compression) = self.compression.as_mut() {
                         self.lapm.discard_pending();
                         compression.reinitialize();
-                    }
-                    if let Some(guess) = self.guess.as_mut() {
-                        guess.reinitialize();
-                    }
-                }
-                // The SABME behind that Reset was a late duplicate and the far
-                // end never reset, so LAPM put its numbering back. Its
-                // dictionaries did not restart either, and ours did: without
-                // compression nothing else needs doing, and with it the only
-                // way back into step is a real re-establishment, which resets
-                // both.
-                Event::ResetUndone => {
-                    if self.compression.is_some() {
-                        self.lapm.connect();
                     }
                 }
                 // N400 attempts at a SABME that nothing answered, or a far end
@@ -1578,23 +1234,6 @@ impl Stack {
                 {
                     self.gave_up = true;
                     self.phase = Phase::Transparent;
-                }
-                // An established link that ran out of retransmissions --
-                // typically the line retraining under it. V.42 8.4.8 has
-                // the entity re-establish rather than wait to be told, and
-                // the caller is still on the line: silence here leaves it
-                // resending into nothing for the rest of the call.
-                // The far modem's DISC on an established link: its user hung
-                // up (ATH after an escape). Nothing to re-establish; whoever
-                // owns the call should end it.
-                Event::Released(Cause::Peer) if self.established => {
-                    self.peer_released = true;
-                }
-                Event::Released(Cause::NoResponse) if self.established => {
-                    if self.reestablishments < REESTABLISHMENTS {
-                        self.reestablishments += 1;
-                        self.lapm.connect();
-                    }
                 }
                 _ => {}
             }
@@ -1617,29 +1256,23 @@ impl Stack {
         // any of this and sends a literal zero will be misread -- and that is
         // the price. It is bounded: the decode fails, the guess is dropped for
         // the rest of the call, and the octets go through raw again.
-        if self.compression.is_none() && self.guess.is_none() && self.may_follow_ecm() {
-            self.guess = Some(crate::guess::Guess::new(&self.guesses()));
-        }
-        if let Some(guess) = self.guess.as_mut() {
-            let verdict = guess.decode(&arrived, &mut self.delivered);
-            if self.follow(verdict) {
-                // Every candidate failed. Nothing negotiated this, so nothing
-                // is owed to it: the octets go through as they came and the
-                // guess is not made again.
-                self.delivered.extend_from_slice(&arrived);
+        if self.compression.is_none() && self.may_follow_ecm() {
+            // The far end never said what parameters it was using, so this is
+            // the only figure there is: what this end offered, which is what
+            // it read before deciding to compress at all.
+            let proposed = self.proposal();
+            self.enable_compression(v42bis::Params {
+                n2: proposed.codewords.unwrap_or(v42bis::OFFERED_N2),
+                n7: proposed.max_string.unwrap_or(v42bis::OFFERED_N7),
+            });
+            if let Some(c) = self.compression.as_mut() {
+                c.speculative = true;
             }
-            return;
         }
         match &mut self.compression {
             Some(c) => {
                 let speculative = c.speculative;
-                let before = self.delivered.len();
-                let decoded = c.decode(&arrived, &mut self.delivered);
-                if decoded {
-                    self.counts.wire_in += arrived.len() as u64;
-                    self.counts.plain_in += (self.delivered.len() - before) as u64;
-                }
-                if !decoded {
+                if !c.decode(&arrived, &mut self.delivered) {
                     if speculative {
                         // A guess that did not come off. Nothing negotiated
                         // this, so nothing is owed to it: put the stream back
@@ -1721,48 +1354,6 @@ mod tests {
         )
     }
 
-    /// 2026-11-16: 15 frames of 128 octets outstanding held a 44 000 bit/s
-    /// downstream behind a 1.1 s round trip to about 1.5 kB/s.
-    #[test]
-    fn data_goes_in_frames_as_long_as_the_far_end_takes() {
-        for (offer, frames) in [(None, 12), (Some(512), 3)] {
-            let mut a = Stack::new(Role::Originator, Params::default());
-            let b = Stack::new(Role::Answerer, Params::default());
-            let mut b = match offer { Some(n) => b.receiving_n401(n), None => b };
-            a.connect();
-            settle(&mut a, &mut b, 20_000, |_, bit| bit);
-            assert!(a.is_connected() && b.is_connected());
-            let before = b.valid_information_frames();
-            let data: Vec<u8> = (0..1536u32).map(|i| (i * 7 % 251) as u8).collect();
-            a.send(&data);
-            settle(&mut a, &mut b, 400_000, |_, bit| bit);
-            assert_eq!(b.take_received(), data);
-            assert_eq!(b.valid_information_frames() - before, frames, "far end offering {offer:?}; a sends {:?}", a.send_limits());
-        }
-    }
-
-    /// 2026-11-20 call 8: the BBS closed and the server was to hang up once
-    /// its last bytes were out. It asked the modem's transmit buffer, which
-    /// V.42 keeps topped up with flags for as long as the call lasts, so the
-    /// call never counted as drained. What says the bytes are out is the far
-    /// end's acknowledgement.
-    #[test]
-    fn data_counts_as_delivered_only_once_the_far_end_acknowledges_it() {
-        let (mut a, mut b) = pair();
-        a.connect();
-        settle(&mut a, &mut b, 20_000, |_, bit| bit);
-        assert!(a.is_connected() && b.is_connected());
-        assert!(a.all_acknowledged(), "an idle link has nothing outstanding");
-        a.send(b"Goodbye!\r\n");
-        assert!(!a.all_acknowledged(), "queued bytes counted as delivered");
-        // Out on the line but unheard: still outstanding.
-        for _ in 0..4000 { let _ = a.next_bit(); }
-        assert!(!a.all_acknowledged(), "bytes the far end never acknowledged counted as delivered");
-        settle(&mut a, &mut b, 40_000, |_, bit| bit);
-        assert_eq!(b.take_received(), b"Goodbye!\r\n");
-        assert!(a.all_acknowledged(), "acknowledged bytes still counted as outstanding");
-    }
-
     #[test]
     fn a_link_establishes_and_carries_data() {
         let (mut a, mut b) = pair();
@@ -1774,44 +1365,6 @@ mod tests {
         a.send(b"login: cactus\r\n");
         settle(&mut a, &mut b, 20_000, |_, bit| bit);
         assert_eq!(b.take_received(), b"login: cactus\r\n");
-    }
-
-    /// The 2026-11-02 V.92 call 6: V.8 had agreed LAPM, so the link was set
-    /// up with Appendix III.2's small N400 for an unconfirmed far end -- and
-    /// kept it. A five-second rate renegotiation used up three T401s with the
-    /// "Password:" frame outstanding, LAPM gave up, and the link went silent
-    /// for the rest of the call while the caller resent its password.
-    #[test]
-    fn an_established_link_outlasts_a_retrain_after_v8_agreed_lapm() {
-        let make = |role| Stack::new(role, Params::default()).declared_lapm().without_detection();
-        let (mut a, mut b) = (make(Role::Originator), make(Role::Answerer));
-        settle(&mut a, &mut b, 60_000, |_, bit| bit);
-        assert!(a.is_connected() && b.is_connected(), "{:?} / {:?}", a.state(), b.state());
-        b.send(b"Password:");
-        settle(&mut a, &mut b, 200_000, |_, _| true); // the line retraining: nothing crosses
-        settle(&mut a, &mut b, 300_000, |_, bit| bit);
-        assert_eq!(a.take_received(), b"Password:");
-        assert!(a.is_connected() && b.is_connected(), "{:?} / {:?}", a.state(), b.state());
-    }
-
-    /// If an established link does run out of retransmissions it starts
-    /// again rather than falling silent: the caller is still there.
-    #[test]
-    fn an_established_link_that_runs_out_of_retries_is_established_again() {
-        let params = Params { n400: 2, ..Params::default() };
-        let make = |role| Stack::new(role, params);
-        let (mut a, mut b) = (make(Role::Originator), make(Role::Answerer));
-        a.connect();
-        settle(&mut a, &mut b, 60_000, |_, bit| bit);
-        assert!(a.is_connected() && b.is_connected());
-        b.send(b"lost in the outage");
-        settle(&mut a, &mut b, 300_000, |_, _| true);
-        settle(&mut a, &mut b, 300_000, |_, bit| bit);
-        assert!(a.is_connected() && b.is_connected(), "{:?} / {:?}", a.state(), b.state());
-        a.take_received();
-        b.send(b"after");
-        settle(&mut a, &mut b, 60_000, |_, bit| bit);
-        assert_eq!(a.take_received(), b"after");
     }
 
     #[test]
@@ -1904,90 +1457,6 @@ mod tests {
         }
         assert_eq!(a.phase(), Phase::Transparent);
         assert!(!a.is_connected(), "established a link with nothing");
-    }
-
-    /// The answerer misses everything the caller sends for the first `deaf`
-    /// bits (a receiver still settling after training); the line is clean
-    /// after that.
-    fn deaf_at_first(a: &mut Stack, b: &mut Stack, deaf: usize, bits: usize) {
-        for i in 0..bits {
-            let to_b = a.next_bit();
-            let to_a = b.next_bit();
-            b.feed_bit(if i < deaf { true } else { to_b });
-            a.feed_bit(to_a);
-            if i % 160 == 0 {
-                a.tick(16);
-                b.tick(16);
-            }
-        }
-    }
-
-    #[test]
-    fn a_caller_whose_first_frames_were_lost_still_gets_error_control() {
-        // 2026-11-19, calls 25, 26 and 29 from one caller: no LAPM in its V.8
-        // menu, straight to XID after training, and an answerer whose receiver
-        // garbled the first second of data mode. Detection timed out, the
-        // answerer went transparent for good, and the caller's retransmitted
-        // XIDs and SABMEs fell on an end that had stopped listening. Its other
-        // five calls, heard cleanly, all came up with V.42.
-        let mut a = Stack::new(Role::Originator, Params::default()).declared_lapm();
-        let mut b = Stack::new(Role::Answerer, Params::default());
-        a.offer_compression(Compression::Both);
-        b.offer_compression(Compression::Both);
-        a.connect();
-        deaf_at_first(&mut a, &mut b, 20_000, 120_000);
-        assert!(b.late_watch_ms == 0, "still watching after the link came up");
-        assert_eq!(b.phase(), Phase::Protocol, "the answerer never noticed the caller does LAPM");
-        assert!(a.is_connected() && b.is_connected(), "the link never came up");
-        a.send(b"hello over V.42");
-        settle(&mut a, &mut b, 20_000, |_, bit| bit);
-        assert_eq!(b.take_received(), b"hello over V.42".to_vec());
-    }
-
-    #[test]
-    fn a_caller_typing_flags_is_not_taken_for_a_late_lapm() {
-        // A terminal without V.42 that types "~" -- the HDLC flag octet --
-        // has to stay a terminal: only a whole frame with a good FCS counts.
-        let mut b = Stack::new(Role::Answerer, Params::default());
-        for i in 0..20_000 {
-            b.next_bit();
-            b.feed_bit(true);
-            if i % 160 == 0 {
-                b.tick(16);
-            }
-        }
-        assert_eq!(b.phase(), Phase::Transparent);
-        assert!(b.late_watch_ms > 0);
-        for &c in b"~~~~~~~~ hello ~~~~ ~~~~~~~~~~~~~~ }~}~ \x7e~~~~\r\n".iter().cycle().take(2000) {
-            // Start bit, eight data bits LSB first, stop bit.
-            b.feed_bit(false);
-            for k in 0..8 {
-                b.feed_bit(c >> k & 1 != 0);
-            }
-            b.feed_bit(true);
-        }
-        assert_eq!(b.phase(), Phase::Transparent, "typed text was taken for LAPM");
-    }
-
-    #[test]
-    fn the_late_lapm_watch_ends() {
-        let mut b = Stack::new(Role::Answerer, Params::default());
-        for _ in 0..(LATE_LAPM_WATCH_MS / 16 + 200) {
-            for _ in 0..160 {
-                b.next_bit();
-                b.feed_bit(true);
-            }
-            b.tick(16);
-        }
-        assert_eq!(b.phase(), Phase::Transparent);
-        assert_eq!(b.late_watch_ms, 0);
-        let mut encoder = Encoder::new(Fcs::Bits16);
-        let info = Stack::new(Role::Originator, Params::default()).proposal().encode(Kind::Command);
-        encoder.frame(&Frame::Xid { pf: false, info }.encode(DLCI_DATA, Role::Originator, Kind::Command));
-        while let Some(bit) = encoder.next_bit() {
-            b.feed_bit(bit);
-        }
-        assert_eq!(b.phase(), Phase::Transparent, "switched to LAPM after the watch ended");
     }
 
     #[test]
@@ -2226,66 +1695,6 @@ mod tests {
     /// V.44 7.3: "the responder shall include parameters for at most one
     /// compression algorithm (V.42 bis or V.44) in the response XID", so the
     /// choice is made once, in the negotiation, and the call runs one of them.
-    /// An answerer that stopped waiting and sent its own V.42bis-only command
-    /// just as the originator's command (offering both) arrived: the two
-    /// exchanges must come to the same algorithm. Seen on a real V.92 modem,
-    /// which was answered "V.44" while this end went on to run V.42bis, and
-    /// reset the link (SABME) on every I frame until it hung up.
-    #[test]
-    fn crossed_xid_commands_settle_on_one_compressor() {
-        let mut b = Stack::new(Role::Answerer, Params::default());
-        b.offer_compression(Compression::Both);
-        b.v44_when_offered();
-        b.enter_negotiating();
-        for _ in 0..400 {
-            if b.commanded_without_v44 { break; }
-            b.tick(100);
-            for _ in 0..800 {
-                b.next_bit();
-            }
-        }
-        assert!(b.commanded_without_v44, "the answerer never sent its own command");
-        let theirs = Xid::proposal(Compression::Both);
-        assert!(theirs.v44.is_some());
-        b.receive_xid(theirs.encode(Kind::Command), Kind::Command);
-        assert_eq!(b.compression_name(), Some("V.42bis"));
-        let mut reply = Xid::proposal(Compression::Both);
-        reply.v44 = None;
-        b.receive_xid(reply.encode(Kind::Response), Kind::Response);
-        assert_eq!(b.compression_name(), Some("V.42bis"));
-    }
-
-    /// The same crossing end to end: the link must come up and carry data.
-    #[test]
-    fn crossed_xid_commands_still_carry_data() {
-        let mut a = Stack::new(Role::Originator, Params::default()).without_detection();
-        let mut b = Stack::new(Role::Answerer, Params::default()).without_detection();
-        a.offer_compression(Compression::Both);
-        b.offer_compression(Compression::Both);
-        b.v44_when_offered();
-        // The answerer alone until it stops waiting and sends its own command.
-        for i in 0..2_000_000 {
-            if b.commanded_without_v44 {
-                break;
-            }
-            b.next_bit();
-            if i % 160 == 0 {
-                b.tick(16);
-            }
-        }
-        assert!(b.commanded_without_v44);
-        settle(&mut a, &mut b, 60_000, |_, bit| bit);
-        a.connect();
-        settle(&mut a, &mut b, 60_000, |_, bit| bit);
-        assert_eq!(a.compression_name(), b.compression_name());
-        let text: Vec<u8> = b"Cooper Dialup Services\r\n\r\nLogin: ".iter().copied().cycle().take(4000).collect();
-        b.send(&text);
-        a.send(b"cooper\r");
-        settle(&mut a, &mut b, 600_000, |_, bit| bit);
-        assert_eq!(a.take_received(), text);
-        assert_eq!(b.take_received(), b"cooper\r");
-    }
-
     #[test]
     fn two_ends_that_know_v44_use_it_and_fall_back_when_one_does_not() {
         let (mut a, mut b) = negotiated_pair();
@@ -2320,26 +1729,6 @@ mod tests {
         a.send(b"and this still crosses");
         settle(&mut a, &mut b, 200_000, |_, bit| bit);
         assert_eq!(b.take_received(), b"and this still crosses");
-    }
-
-    /// How much the compressor saved, both ways, so a call's log can say.
-    #[test]
-    fn compression_counts_what_went_in_and_what_crossed() {
-        let (mut a, mut b) = negotiated_pair();
-        a.connect();
-        settle(&mut a, &mut b, 40_000, |_, bit| bit);
-        assert_eq!(a.compression_counts(), Some(CompressionCounts::default()));
-        let text: Vec<u8> = b"the same line of text over and over and over\n"
-            .iter().copied().cycle().take(24_000).collect();
-        a.send(&text);
-        settle(&mut a, &mut b, 3_000_000, |_, bit| bit);
-        assert_eq!(b.take_received(), text);
-        let sent = a.compression_counts().unwrap();
-        let got = b.compression_counts().unwrap();
-        assert_eq!(sent.plain_out, 24_000);
-        assert!(sent.wire_out * 4 < sent.plain_out, "repeated text hardly compressed: {sent:?}");
-        assert_eq!(got.wire_in, sent.wire_out, "what one end compressed is what the other read");
-        assert_eq!(got.plain_in, 24_000);
     }
 
     /// V.44 7.3, NOTE: "The responder shall include parameters for at most one
@@ -2430,72 +1819,6 @@ mod tests {
         a.send(b"plain");
         settle(&mut a, &mut b, 200_000, |_, bit| bit);
         assert_eq!(b.take_received(), b"plain");
-    }
-
-    /// Whether any frame in `frames` carries the V.44 user data subfield,
-    /// which opens with the set identifier "V44" (V.44 Table 7).
-    fn carries_v44(frames: &[Vec<u8>]) -> bool {
-        frames.iter().any(|f| f.windows(3).any(|w| w == b"V44"))
-    }
-
-    /// An answerer that offers V.44 only when asked still ends up on V.44
-    /// with a far end that asks.
-    #[test]
-    fn an_answerer_offering_v44_when_offered_agrees_it_with_a_v44_caller() {
-        let (mut a, mut b) = negotiated_pair();
-        b.v44_when_offered();
-        a.connect();
-        settle(&mut a, &mut b, 80_000, |_, bit| bit);
-        assert!(a.is_connected() && b.is_connected(), "the link did not come up");
-        assert_eq!(a.compression_name(), Some("V.44"));
-        assert_eq!(b.compression_name(), Some("V.44"));
-        let text: Vec<u8> = b"cooper dialup services ".iter().copied().cycle().take(8_000).collect();
-        a.send(&text);
-        b.send(&text);
-        settle(&mut a, &mut b, 2_000_000, |_, bit| bit);
-        assert_eq!(b.take_received(), text, "upstream did not survive V.44");
-        assert_eq!(a.take_received(), text, "downstream did not survive V.44");
-    }
-
-    /// A V.42bis-era caller never sees the V.44 subfield from such an answerer,
-    /// in a command or an answer, and the call settles on V.42bis.
-    #[test]
-    fn an_answerer_offering_v44_when_offered_never_shows_it_to_an_old_caller() {
-        let (mut a, mut b) = negotiated_pair();
-        a.without_v44();
-        b.v44_when_offered();
-        a.connect();
-        settle(&mut a, &mut b, 40_000, |_, bit| bit);
-        assert!(a.is_connected() && b.is_connected(), "the link did not come up");
-        assert!(!carries_v44(&sent(&mut b)), "the answerer showed V.44 to a caller that never offered it");
-        assert_eq!(a.compression_name(), Some("V.42bis"));
-        assert_eq!(b.compression_name(), Some("V.42bis"));
-    }
-
-    /// The hold is bounded: an originator that sends no XID still gets
-    /// the answerer's command, without V.44 in it.
-    #[test]
-    fn an_answerer_holding_for_the_caller_s_xid_still_sends_its_own_after_t401() {
-        let mut b = Stack::new(Role::Answerer, Params::default()).without_detection();
-        b.offer_compression(Compression::Both);
-        b.v44_when_offered();
-        let t401 = b.lapm.t401_ms();
-        // Past one T401, where the originator would retransmit: nothing yet.
-        for _ in 0..(t401 * 3 / 2 / 10) {
-            for _ in 0..20 { b.next_bit(); b.feed_bit(true); }
-            b.tick(10);
-        }
-        assert!(sent(&mut b).is_empty(), "the answerer did not wait for the caller's XID");
-        // Past the hold: the command goes out, still without V.44.
-        for _ in 0..(t401 / 10 + 10) {
-            for _ in 0..20 { b.next_bit(); b.feed_bit(true); }
-            b.tick(10);
-        }
-        idle(&mut b);
-        let frames = sent(&mut b);
-        assert!(!frames.is_empty(), "the answerer never sent its own XID");
-        assert_eq!(frames[0][1] & !0x10, 0xaf, "the first frame was not an XID");
-        assert!(!carries_v44(&frames), "an unasked-for XID carried V.44");
     }
 
     #[test]
@@ -2701,25 +2024,6 @@ mod tests {
         assert!(!b.is_connected(), "the answerer is {:?}", b.state());
     }
 
-    /// ATH after an escape: the far modem sends DISC on an established link.
-    /// The end that heard it reports the release so the call can end; the end
-    /// that sent it does not, and a link brought back up clears it.
-    #[test]
-    fn a_peer_disc_on_an_established_link_is_reported() {
-        let (mut a, mut b) = pair();
-        a.connect();
-        settle(&mut a, &mut b, 20_000, |_, bit| bit);
-        assert!(!a.peer_released() && !b.peer_released());
-        a.disconnect();
-        settle(&mut a, &mut b, 20_000, |_, bit| bit);
-        assert!(b.peer_released(), "the answerer is {:?}", b.state());
-        assert!(!a.peer_released(), "the end that sent DISC reported it");
-        a.connect();
-        settle(&mut a, &mut b, 20_000, |_, bit| bit);
-        assert!(a.is_connected() && b.is_connected());
-        assert!(!b.peer_released(), "re-establishment did not clear the release");
-    }
-
     /// An XID that arrives after this end stopped waiting still decides the
     /// width of what follows.
     ///
@@ -2794,38 +2098,12 @@ mod tests {
     /// octet goes through untouched -- and the guess is made once.
     #[test]
     fn a_far_end_that_compresses_without_asking_is_followed() {
-        let (text, received) = followed(v42bis::Params { n2: v42bis::OFFERED_N2, n7: v42bis::OFFERED_N7 });
-        assert_eq!(received, text, "the screen got something other than what the far end sent");
-    }
-
-    /// The same far end, using the parameters V.42bis 6.4 gives a link whose
-    /// XID never got through: N2 512, N7 6. On a line losing hundreds of
-    /// frames the far end's XID is exactly what goes missing, and it carries
-    /// on with the defaults while this end, guessing its own offer, built a
-    /// dictionary four times the size and strings forty times as long.
-    #[test]
-    fn a_far_end_compressing_with_the_defaults_is_followed() {
-        let (text, received) = followed(v42bis::Params { n2: v42bis::DEFAULT_N2, n7: v42bis::DEFAULT_N7 });
-        assert_eq!(received, text, "the screen got something other than what the far end sent");
-    }
-
-    /// And one that settled below this end's offer: it heard the offer and
-    /// took the lower of the two, which was its own -- the common 2048 and 32.
-    #[test]
-    fn a_far_end_compressing_with_its_own_lower_figures_is_followed() {
-        let (text, received) = followed(v42bis::Params { n2: 2048, n7: 32 });
-        assert_eq!(received, text, "the screen got something other than what the far end sent");
-    }
-
-    /// Text compressed with `params` by a far end that never sent an XID,
-    /// framed and fed to an originator that offered V.42bis: what was sent
-    /// and what reached the terminal.
-    fn followed(params: v42bis::Params) -> (Vec<u8>, Vec<u8>) {
         use crate::frame::Kind;
 
         // What the far end puts on the line: text, and then V.42bis deciding
         // it is worth compressing, which it announces with the escape
         // character and ECM and in no other way.
+        let params = v42bis::Params { n2: v42bis::OFFERED_N2, n7: v42bis::OFFERED_N7 };
         let text: Vec<u8> = b"Welcome to the board. Please log in. "
             .iter()
             .copied()
@@ -2886,10 +2164,11 @@ mod tests {
             wire(&mut stack, &frame.encode(DLCI_DATA, Role::Answerer, Kind::Command));
         }
 
-        for _ in 0..40 {
-            stack.tick(100);
-        }
-        (text, stack.take_received())
+        assert_eq!(
+            stack.take_received(),
+            text,
+            "the screen got something other than what the far end sent",
+        );
     }
 
 

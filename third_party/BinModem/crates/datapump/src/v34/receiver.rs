@@ -48,7 +48,6 @@ use std::collections::VecDeque;
 use dsp::{Complex, least_squares};
 
 use super::constellation::Point;
-use super::data::Warp;
 use super::qam::{Band, ROLLOFF};
 use super::signals::{self, Size};
 use crate::v32::Mode;
@@ -157,9 +156,6 @@ const DENSE_WINDOW: usize = 64;
 /// steps of a half symbol it then tries either side of the best.
 const DENSE_STEPS: usize = 16;
 const DENSE_DEGREES: f64 = 1.5;
-/// The resync's rotation search goes in this many of those steps at a time,
-/// then one at a time either side of the best (see `resync_dense`).
-const DENSE_COARSE: usize = 4;
 const DENSE_FINE: usize = 64;
 
 /// Normalised least-mean-squares step.
@@ -186,12 +182,6 @@ pub enum Slicer {
     /// grid units: data mode, whose trellis decoder makes the real decisions
     /// some symbols later than the loops can wait.
     Grid { scale: f64, limit: i32 },
-    /// The same grid, for a far end whose points are bent by 9.7's non-linear
-    /// encoder: each received point is unbent before it is decided, and the
-    /// decision bent back to where the far end put it. Decided against the
-    /// straight grid, the outer points of a shaped signal land between grid
-    /// points and drag the loops with them.
-    BentGrid { scale: f64, limit: i32, warp: Warp },
 }
 
 impl Slicer {
@@ -204,13 +194,6 @@ impl Slicer {
                 let point = (odd(z.re), odd(z.im));
                 (point, Complex::new(f64::from(point.0), f64::from(point.1)).scale(1.0 / scale))
             }
-            Self::BentGrid { scale, limit, warp } => {
-                let straight = warp.unbend(z.scale(scale));
-                let odd = |v: f64| (2 * ((v - 1.0) / 2.0).round() as i32 + 1).clamp(-limit, limit);
-                let point = (odd(straight.re), odd(straight.im));
-                let target = warp.bend(Complex::new(f64::from(point.0), f64::from(point.1)));
-                (point, target.scale(1.0 / scale))
-            }
         }
     }
 
@@ -218,7 +201,7 @@ impl Slicer {
     fn min_distance_squared(self) -> f64 {
         match self {
             Self::Points(size) => min_distance_squared(size),
-            Self::Grid { scale, .. } | Self::BentGrid { scale, .. } => (2.0 / scale).powi(2),
+            Self::Grid { scale, .. } => (2.0 / scale).powi(2),
         }
     }
 
@@ -238,7 +221,7 @@ impl Slicer {
     fn adapt_level(self) -> f64 {
         match self {
             Self::Points(size) => 0.25 * min_distance_squared(size),
-            Self::Grid { .. } | Self::BentGrid { .. } => 0.4 * self.min_distance_squared() / 6.0,
+            Self::Grid { .. } => 0.4 * self.min_distance_squared() / 6.0,
         }
     }
 
@@ -252,7 +235,7 @@ impl Slicer {
     fn lost_level(self) -> f64 {
         match self {
             Self::Points(_) => 0.25 * self.min_distance_squared(),
-            Self::Grid { .. } | Self::BentGrid { .. } => self.min_distance_squared() / 12.0,
+            Self::Grid { .. } => self.min_distance_squared() / 12.0,
         }
     }
 
@@ -263,7 +246,7 @@ impl Slicer {
     fn lost_threshold(self, settled: f64) -> f64 {
         match self {
             Self::Points(_) => (8.0 * settled).max(self.lost_level()),
-            Self::Grid { .. } | Self::BentGrid { .. } => (2.0 * settled).max(self.lost_level()),
+            Self::Grid { .. } => (2.0 * settled).max(self.lost_level()),
         }
     }
 
@@ -273,7 +256,7 @@ impl Slicer {
             Self::Points(_) => (4.0 * settled).max(0.0625 * self.min_distance_squared()),
             // Garbage is a sixth of a step squared here, and not far above a
             // locked signal at the rates this is used for, so the bar is close.
-            Self::Grid { .. } | Self::BentGrid { .. } => (2.0 * settled).max(0.4 * self.min_distance_squared() / 6.0),
+            Self::Grid { .. } => (2.0 * settled).max(0.4 * self.min_distance_squared() / 6.0),
         }
     }
 
@@ -282,7 +265,7 @@ impl Slicer {
     fn window(self) -> (usize, usize) {
         match self {
             Self::Points(_) => (RESYNC_WINDOW, 8),
-            Self::Grid { .. } | Self::BentGrid { .. } => (4 * RESYNC_WINDOW, 32),
+            Self::Grid { .. } => (4 * RESYNC_WINDOW, 32),
         }
     }
 }
@@ -366,33 +349,15 @@ struct Hunt {
     /// The last four samples against the template, and the template's power.
     matches: VecDeque<(f64, f64)>,
     lapsed: usize,
-    /// Halves heard since S was sure, before a turn to S-bar counts: 0 for
-    /// any, [`Self::FULL_S`] where the far end owes a whole S.
-    least: usize,
-    run: usize,
 }
 
 impl Hunt {
     /// Halves of S in a row before its template is trusted: twenty symbols.
     const HELD: usize = 40;
 
-    /// The S that opens a phase 3 lasts 128T before its S-bar (V.34 11.3,
-    /// V.90 9.3.1.1). S is sure about forty symbols in, so a whole S leaves
-    /// some 88 symbols after that; 64 is asked. What turns sooner is not
-    /// that S: on 2026-11-21 (call 37, an echo of peak 0.35) a hunt took
-    /// this end's own phase 2 coming back for S and S-bar 26 ms into phase
-    /// 3, where the real one turns 105 to 117 ms in, and training on it
-    /// failed every time.
-    const FULL_S: usize = 2 * 64;
-
-    fn full_s() -> Self {
-        Self { least: Self::FULL_S, ..Self::default() }
-    }
-
     fn feed(&mut self, half: Complex, index: u64) -> Option<Hunted> {
         let phase = (index % 4) as usize;
         if self.armed {
-            self.run += 1;
             let t = self.template[phase];
             self.matches.push_back(((half * t.conj()).re, t.norm_sqr()));
             if self.matches.len() > 4 {
@@ -401,12 +366,6 @@ impl Hunt {
             let (along, power) = self.matches.iter().fold((0.0, 0.0), |(a, p), &(x, y)| (a + x, p + y));
             let ratio = along / power.max(1e-12);
             if self.matches.len() == 4 && ratio < -0.5 {
-                if self.run < self.least {
-                    // Turned before a whole S could have: not that S. Start
-                    // the hunt again.
-                    *self = Self { least: self.least, ..Self::default() };
-                    return None;
-                }
                 // The first of the four that turned it.
                 return Some(Hunted::Reversal(index.saturating_sub(3)));
             }
@@ -678,12 +637,6 @@ impl Receiver {
         self.mode = Mode3::Hunting(Hunt::default());
     }
 
-    /// Look for the S that opens a phase 3, owed in full (128T) before its
-    /// S-bar: a turn sooner than that is not taken for it.
-    pub fn hunt_full_s(&mut self) {
-        self.mode = Mode3::Hunting(Hunt::full_s());
-    }
-
     /// Train on `reference`, which starts sixteen symbols after the S-bar at
     /// half-symbol sample `s_bar`, and is sent by a modem whose scrambler is
     /// `far`'s.
@@ -758,16 +711,6 @@ impl Receiver {
     pub fn set_grid(&mut self, scale: f64, limit: i32) {
         self.data_mode = true;
         self.set_slicer(Slicer::Grid { scale, limit });
-    }
-
-    /// The same, for a far end that uses non-linear encoding (9.7): decided
-    /// with the bend taken out (see [`Slicer::BentGrid`]). With no bend, the
-    /// plain grid.
-    pub fn set_bent_grid(&mut self, scale: f64, limit: i32, warp: Option<Warp>) {
-        match warp {
-            Some(warp) => self.set_slicer(Slicer::BentGrid { scale, limit, warp }),
-            None => self.set_grid(scale, limit),
-        }
     }
 
     /// Decide against `slicer` from here, forgetting what the last one made of
@@ -1284,50 +1227,16 @@ impl Receiver {
                     c = num.scale(1.0 / den);
                 }
             }
-            // A dense decision grid can appear better after shrinking the
-            // equalizer toward neighbouring points. It is not a measurement
-            // of physical gain. Preserve the trained scale in data mode;
-            // retain the small correction needed for ordinary codec drift.
-            if self.data_mode && !(0.98..=1.02).contains(&c.abs()) {
-                return (f64::INFINITY, c);
-            }
             (mse(outputs, c), c)
         };
         let settle = |outputs: &[Complex]| {
             let turns = (90.0 / DENSE_DEGREES) as usize;
-            // The rotation whose error is least, the first of equals. Each
-            // one's error is summed only while it can still be the least:
-            // the terms are never negative, so a sum already past the best
-            // stays past it, and stopping there finds what summing every
-            // term did, at a fraction of the decisions. This search was
-            // 40 ms of the server's step on a live x2 upstream, every time
-            // a few symbols went astray, and the line heard it as a stall.
-            let mut best: Option<(f64, usize)> = None;
-            let try_turn = |q: usize, best: &mut Option<(f64, usize)>| {
-                let c = Complex::from_polar(1.0, -(self.rotation + (q as f64 * DENSE_DEGREES).to_radians()));
-                let bound = best.map_or(f64::INFINITY, |b| b.0);
-                let mut sum = 0.0;
-                for y in outputs {
-                    sum += (*y * c - self.slicer.decide(*y * c).1).norm_sqr();
-                    if sum >= bound {
-                        break;
-                    }
-                }
-                if sum < bound || (sum == bound && best.is_some_and(|b| q < b.1)) {
-                    *best = Some((sum, q));
-                }
-            };
-            for q in (0..turns).step_by(DENSE_COARSE) {
-                try_turn(q, &mut best);
-            }
-            if let Some((_, around)) = best {
-                for d in 1..DENSE_COARSE {
-                    try_turn((around + d) % turns, &mut best);
-                    try_turn((around + turns - d) % turns, &mut best);
-                }
-            }
-            let q = best.map_or(0, |b| b.1);
-            fit(outputs, Complex::from_polar(1.0, -(self.rotation + (q as f64 * DENSE_DEGREES).to_radians())))
+            let coarse = (0..turns)
+                .map(|q| Complex::from_polar(1.0, -(self.rotation + (q as f64 * DENSE_DEGREES).to_radians())))
+                .map(|c| (mse(outputs, c), c))
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map_or(Complex::ONE, |(_, c)| c);
+            fit(outputs, coarse)
         };
         let mut readings = Vec::new();
         let mut best: Option<(f64, f64, Complex)> = None;
@@ -1409,7 +1318,7 @@ impl Receiver {
     /// carrier's turn is found again from the symbols' fourth power, to within
     /// a quarter -- which the same differential coding does not mind either.
     fn resync(&mut self) {
-        if matches!(self.slicer, Slicer::Grid { .. } | Slicer::BentGrid { .. }) {
+        if matches!(self.slicer, Slicer::Grid { .. }) {
             self.resync_dense();
             return;
         }
@@ -1627,7 +1536,7 @@ mod tests {
     /// Hear phase 3 as a call modem would: find S-bar, train, and read J.
     fn listen(samples: &[f64], band: Band) -> Heard3 {
         let mut rx = Receiver::new(band, FS);
-        rx.hunt_full_s();
+        rx.hunt();
         let mut reader = Reader::new(Mode::Answer);
         let mut in_trn = true;
         let mut bits: Vec<bool> = Vec::new();
@@ -1682,29 +1591,6 @@ mod tests {
             if matches!(hunt.feed(point,n as u64),Some(Hunted::S)) {heard=true;break;}
         }
         assert!(heard,"noisy S never armed");
-    }
-
-    #[test]
-    fn a_turn_before_a_whole_s_is_not_taken_for_s_bar() {
-        // S, as half-symbol samples, and S-bar, the same turned round.
-        let s = [Complex::new(1.0, 1.0), Complex::I, Complex::new(-1.0, 1.0), Complex::I];
-        let run = |mut hunt: Hunt, s_symbols: usize| {
-            let halves = 2 * s_symbols;
-            (0..halves + 64).find_map(|n| {
-                let point = if n < halves { s[n % 4] } else { s[n % 4].scale(-1.0) };
-                match hunt.feed(point, n as u64) {
-                    Some(Hunted::Reversal(at)) => Some(at),
-                    _ => None,
-                }
-            })
-        };
-        // 80 symbols of S and a turn: what a plain hunt takes, and what the
-        // echo of call 37 looked like.
-        assert!(run(Hunt::default(), 80).is_some(), "a plain hunt missed it");
-        assert_eq!(run(Hunt::full_s(), 80), None, "took a short S for the opening one");
-        // A whole S, 128T, still turns.
-        let at = run(Hunt::full_s(), signals::S_SYMBOLS).expect("a whole S never turned");
-        assert!(at.abs_diff(2 * signals::S_SYMBOLS as u64) <= 4, "turned at half {at}");
     }
 
     #[test]
@@ -1768,7 +1654,7 @@ mod tests {
     /// carried on from J if not.
     #[test]
     fn dense_recovery_tracks_carrier_rotation_across_its_window() {
-        for (turn, input_gain) in [(0.0,1.0), (0.003,1.0), (-0.003,1.0), (0.0,0.99), (0.0,0.85)] {
+        for turn in [-0.003, 0.003] {
             let mut rx = Receiver::new(Band::new(SymbolRate::S3200, false), 32000.0);
             // Isolate carrier recovery from the front-end filter: interpolate
             // a known dense symbol grid exactly at its sampling instants.
@@ -1792,7 +1678,7 @@ mod tests {
                 let at = symbol.floor() as usize;
                 let fraction = symbol - at as f64;
                 (points[at].scale(1.0 - fraction) + points[at + 1].scale(fraction))
-                    * Complex::from_polar(input_gain, 0.21 + turn * symbol)
+                    * Complex::from_polar(1.0, 0.21 + turn * symbol)
             }).collect();
             rx.taken = 3000;
             rx.times = (0..500).map(|i| i as f64 * rx.half).collect();
@@ -1806,14 +1692,8 @@ mod tests {
             rx.data_mode = true;
             rx.settled = 1e-6;
             rx.lost = Some(10);
-            let before = rx.taps.clone();
             rx.resync_dense();
-            if input_gain == 0.85 {
-                assert!(rx.is_lost(), "a large unexplained gain correction must not relock a dense grid");
-                assert_eq!(rx.taps,before,"rejected resync changed trained equalizer scale");
-                continue;
-            }
-            assert!(!rx.is_lost(), "dense carrier recovery failed at turn {turn}, gain {input_gain}");
+            assert!(!rx.is_lost(), "dense carrier recovery failed at turn {turn}");
             let error = angle_between(rx.rotation, 0.21 + turn * 160.0);
             assert!(error < 0.001, "recovered phase lagged the next symbol by {error} radians");
         }

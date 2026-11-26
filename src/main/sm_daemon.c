@@ -43,8 +43,6 @@ static void usage(void)
             "  --v8                 negotiate with V.8 first (else plain answer tone)\n"
             "  --v34                offer V.34 in the V.8 menu (opt-in). Use\n"
             "                       --binmodem or --v90 for the V.34 data engine.\n"
-            "  --v23|--v23c         dedicated V.23: 1200 down / 75 up, transparent\n"
-            "  --v23-reverse        V.23: 75 down / 1200 up, transparent\n"
             "  --v32                dedicated V.32 answerer, up to 9600 bit/s\n"
             "  --v32bis             dedicated V.32bis answerer, up to 14400 bit/s\n"
             "                       Both support V.42/V.42bis. V.8 modes also\n"
@@ -160,11 +158,6 @@ int main(int argc, char **argv)
             cfg.use_v34 = 1;
         else if (strcmp(argv[i], "--binmodem") == 0)
             cfg.use_binmodem = 1;
-        else if (strcmp(argv[i], "--v23") == 0 || strcmp(argv[i], "--v23c") == 0 || strcmp(argv[i], "--v23-reverse") == 0)
-        {
-            cfg.v23_mode = strcmp(argv[i], "--v23-reverse") == 0 ? 2 : 1;
-            cfg.use_binmodem = 1;
-        }
         else if (strcmp(argv[i], "--v32") == 0 || strcmp(argv[i], "--v32bis") == 0)
         {
             cfg.v32_max_rate = strcmp(argv[i], "--v32") == 0 ? 9600 : 14400;

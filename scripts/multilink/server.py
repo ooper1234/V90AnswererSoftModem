@@ -11,32 +11,15 @@ import time
 
 
 def ppp_arguments(peer_ip='10.0.2.15'):
-    # The answerer may see carrier before the caller switches its serial
-    # interface to data. Wait for the caller's first LCP rather than sending
-    # requests into that guard interval. A 75 bps return channel also needs
-    # several seconds for an escaped LCP reply; retries must not outrun it.
-    args = ['/usr/sbin/pppd', 'notty', 'nodetach', 'local', 'noauth', 'silent',
-            'noipdefault', 'nodefaultroute', 'noipv6', 'noccp',
+    return ['/usr/sbin/pppd', 'notty', 'nodetach', 'local', 'noauth',
+            'noipdefault', 'nodefaultroute', 'noipv6', 'noccp', 'novj',
             'multilink', 'mrru', '1600', 'mru', '1500', 'mtu', '1500',
             'bundle', 'v90-windows', 'endpoint', 'local:56.39.30.4d.50',
             '10.0.2.2:' + peer_ip, 'ms-dns', os.environ.get('V90_PPP_DNS', '10.0.2.3'),
             'lcp-max-configure', '120', 'ipcp-max-configure', '120',
-            'lcp-restart', '30', 'ipcp-restart', '30',
-            'lcp-echo-interval', '30', 'lcp-echo-failure', '6',
+            'lcp-restart', '10', 'ipcp-restart', '10',
+            'lcp-echo-interval', '15', 'lcp-echo-failure', '6',
             'debug', 'hide-password', 'logfd', '2']
-    # Native pppd/kernel negotiation handles VJ and peer rejection. Header
-    # compression saves scarce return-channel capacity on split-speed V.23.
-    if os.environ.get('V90_PPP_VJ', '0') != '1':
-        args.append('novj')
-    return args
-
-
-def admission_allowed(address, config, session_count, uplink, ready, configured):
-    # The VPN kill switch, rather than a working remote relay, is required
-    # for safe PPP admission. Keep IPCP and local gateway traffic available
-    # while the VPN reconnects; its firewall still blocks home egress.
-    protected = configured if uplink == 'vpngate' else ready
-    return address in config['allowed_clients'] and session_count < 4 and protected
 
 
 def serve_link(stream, stopping, children, lock, peer_ip='10.0.2.15'):
@@ -97,10 +80,7 @@ def main():
                 stream, address = listener.accept()
             except socket.timeout:
                 continue
-            if not admission_allowed(address[0], config, len(sessions),
-                    os.environ.get('V90_UPLINK', 'wifi'),
-                    Path('/run/v90-uplink-ready').exists(),
-                    Path('/run/v90-uplink-configured').exists()):
+            if address[0] not in config['allowed_clients'] or len(sessions) >= 4 or not Path('/run/v90-uplink-ready').exists():
                 stream.close()
                 continue
             stream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)

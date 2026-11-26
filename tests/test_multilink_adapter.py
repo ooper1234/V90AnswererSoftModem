@@ -3,32 +3,11 @@ import importlib.util
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
 
 directory = Path(__file__).resolve().parents[1] / 'scripts' / 'multilink'
 sys.path.insert(0, str(directory))
 from ppp_wire import Decoder, frame
-from server import admission_allowed, ppp_arguments
-
-
-class Admission(unittest.TestCase):
-    def test_vpn_outage_preserves_ppp_only_after_firewall_configuration(self):
-        config = {'allowed_clients': ['10.77.90.2']}
-        self.assertTrue(admission_allowed('10.77.90.2', config, 0,
-                                         'vpngate', False, True))
-        self.assertFalse(admission_allowed('10.77.90.2', config, 0,
-                                          'vpngate', True, False))
-        self.assertFalse(admission_allowed('10.77.90.9', config, 0,
-                                          'vpngate', False, True))
-        self.assertFalse(admission_allowed('10.77.90.2', config, 4,
-                                          'vpngate', False, True))
-
-    def test_wifi_still_requires_ready_uplink(self):
-        config = {'allowed_clients': ['10.77.90.2']}
-        self.assertFalse(admission_allowed('10.77.90.2', config, 0,
-                                          'wifi', False, True))
-        self.assertTrue(admission_allowed('10.77.90.2', config, 0,
-                                         'wifi', True, False))
+from server import ppp_arguments
 
 
 class Framing(unittest.TestCase):
@@ -54,23 +33,6 @@ class Framing(unittest.TestCase):
         self.assertIn('nodefaultroute', args)
         self.assertEqual(args[args.index('bundle') + 1], 'v90-windows')
         self.assertIn('hide-password', args)
-
-    def test_vj_protocols_survive_stream_boundaries_and_corruption(self):
-        packets = [(0x2d, b'\x80\x7e\x7d\x00'), (0x2f, bytes(range(64)))]
-        damaged = bytearray(frame(0x2d, b'bad context'))
-        damaged[-3] ^= 1
-        wire = bytes(damaged) + b''.join(frame(p, data) for p, data in packets)
-        decoder = Decoder()
-        recovered = []
-        for byte in wire:
-            recovered += decoder.feed(bytes([byte]))
-        self.assertEqual(recovered, packets)
-
-    def test_vj_negotiation_can_be_disabled(self):
-        with patch.dict('os.environ', {'V90_PPP_VJ': '1'}):
-            self.assertNotIn('novj', ppp_arguments())
-        with patch.dict('os.environ', {'V90_PPP_VJ': '0'}):
-            self.assertIn('novj', ppp_arguments())
 
 
 if __name__ == '__main__':

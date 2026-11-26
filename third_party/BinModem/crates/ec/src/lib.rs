@@ -6,9 +6,7 @@
 pub mod bits;
 pub mod detect;
 pub mod frame;
-mod guess;
 pub mod hdlc;
-pub mod mnp;
 pub mod lapm;
 pub mod stack;
 pub mod v42bis;

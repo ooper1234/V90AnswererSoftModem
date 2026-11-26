@@ -187,25 +187,6 @@ fn decode_recorded_digital_capabilities() {
 
 #[test]
 #[ignore = "requires local line capture"]
-fn inspect_recorded_phase2_messages() {
-    use datapump::v34::dpsk::{Receiver, Side};
-    let (rate, samples) = read_wav(&std::env::var("V90_CAPTURE").unwrap());
-    let start = std::env::var("V90_AT").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-    let first = (start * f64::from(rate)) as usize;
-    for channel in 0..2 {
-        for side in [Side::Call, Side::Answer] {
-            let mut receiver = Receiver::new(side, f64::from(rate));
-            for (n, pair) in samples[first * 2..].chunks_exact(2).enumerate() {
-                if let Some(info) = receiver.feed(f64::from(pair[channel]) / 32768.0) {
-                    println!("channel={channel} side={side:?} t={:.4} {info:?}", (first + n) as f64 / f64::from(rate));
-                }
-            }
-        }
-    }
-}
-
-#[test]
-#[ignore = "requires local line capture"]
 fn inspect_recorded_retrain_s_detection() {
     use datapump::v34::{receiver::{Receiver, Heard}, info::SymbolRate, qam::Band};
     let (rate, samples) = read_wav(&std::env::var("V90_CAPTURE").unwrap());

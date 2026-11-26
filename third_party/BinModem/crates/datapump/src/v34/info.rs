@@ -29,12 +29,6 @@ pub const INFO1A_BITS: usize = 70;
 /// [of INFO1d] are identical to those of INFO1c in Recommendation V.34".
 pub const INFO0D_BITS: usize = 62;
 
-/// Bits in U.S. Robotics x2's marker, fill to fill: the INFO frame with a
-/// seven-bit body, which an x2 client sends in place of its L1, L2 and INFO1c
-/// (libv90modem's `docs/history/x2-facts.md`, "Phase 2 marker", from D-Modem
-/// and courier-emu). 4 + 8 + 7 + 16 + 4.
-pub const X2_MARKER_BITS: usize = 39;
-
 /// Bits 37:39 of an INFO1a that asks for V.90: "Symbol rate of 8000 to be used
 /// by the digital modem: The integer 6" (Table 10/V.90). Six is not one of
 /// V.34's symbol rates, which is what tells the two INFO1a apart.
@@ -506,56 +500,6 @@ impl Info1aPcm {
     }
 }
 
-/// U.S. Robotics x2's marker: the client's word that it is an x2 client and
-/// what it will send upstream. Not part of V.34.
-///
-/// The body, low-order first: bit 0 the carrier (1 the high one); bits 1 to
-/// 3 the first modulation index, which is 6 (the PCM direction) for an x2
-/// client calling a server; bits 4 to 6 the second, the client's V.34 symbol
-/// rate as INFO1a numbers them (4 is 3200 baud). A Courier sends `4d`. Any
-/// other first index is not x2 (x2-facts, "Phase 2 marker").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct X2Marker {
-    pub high_carrier: bool,
-    pub first: u8,
-    pub second: u8,
-}
-
-impl X2Marker {
-    /// The first index an x2 client calling a server sends.
-    pub const PCM: u8 = 6;
-
-    /// The body as one number, bit 0 first in time.
-    pub fn body(&self) -> u8 {
-        u8::from(self.high_carrier) | (self.first & 7) << 1 | (self.second & 7) << 4
-    }
-
-    pub fn from_body(body: u8) -> Self {
-        Self { high_carrier: body & 1 != 0, first: (body >> 1) & 7, second: (body >> 4) & 7 }
-    }
-
-    /// Whether this is an x2 client's, asking for PCM downstream.
-    pub fn is_x2(&self) -> bool {
-        self.first == Self::PCM
-    }
-
-    /// The client's upstream symbol rate, if the index names one.
-    pub fn symbol_rate(&self) -> Option<SymbolRate> {
-        SymbolRate::ALL.get(usize::from(self.second)).copied()
-    }
-
-    pub fn to_bits(&self) -> Vec<bool> {
-        let mut info = Vec::with_capacity(7);
-        put(&mut info, u32::from(self.body()), 7);
-        frame(&info)
-    }
-
-    pub fn from_bits(bits: &[bool]) -> Option<Self> {
-        let info = unframe(bits, X2_MARKER_BITS)?;
-        Some(Self::from_body(get(info, 0, 7) as u8))
-    }
-}
-
 /// Any of them, as a receiver hands it over.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Info {
@@ -567,33 +511,11 @@ pub enum Info {
     Info0d(Info0d),
     /// V.90's INFO1a, asking for phase 3 of V.90.
     Info1aPcm(Info1aPcm),
-    /// V.92 short Phase 2, with an explicit QAM carrier selection.
-    Info1aShortQam(crate::v92::ShortQamRequest),
-    /// V.92's INFO1a asking for PCM upstream (Table 18).
-    Info1aPcmUpstream(crate::v92::PcmUpstreamRequest),
-    /// An x2 client's marker, heard only by a receiver asked for them.
-    X2Marker(X2Marker),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_couriers_x2_marker_is_4d_and_its_crc_24dd() {
-        // x2-facts "Phase 2 marker": the Courier's body 4d, high carrier,
-        // PCM, 3200 baud, and its CRC.
-        let m = X2Marker::from_body(0x4d);
-        assert!(m.high_carrier && m.is_x2());
-        assert_eq!(m.symbol_rate(), Some(SymbolRate::S3200));
-        let info: Vec<bool> = (0..7).map(|k| 0x4d >> k & 1 == 1).collect();
-        assert_eq!(crc(&info), 0x24dd);
-        let bits = m.to_bits();
-        assert_eq!(bits.len(), X2_MARKER_BITS);
-        assert_eq!(X2Marker::from_bits(&bits), Some(m));
-        // 48 and 49 are plain V.34's, not x2.
-        assert!(!X2Marker::from_body(0x48).is_x2());
-    }
 
     #[test]
     fn every_sequence_is_the_length_its_table_says() {

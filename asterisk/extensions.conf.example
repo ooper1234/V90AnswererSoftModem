@@ -10,18 +10,9 @@
 ; This file is an example; merge into your /etc/asterisk/extensions.conf.
 
 [modem-incoming]
-; Dedicated V.23 instance on 9106; start it with --v23 (see docs/v23.md).
-exten => 5551023,1,NoOp(V.23 1200/75 modem call)
- same => n,Set(UUID=${SHELL(uuidgen)})
- same => n,Set(JITTERBUFFER(fixed)=200,1000)
- same => n,Answer()
- same => n,AudioSocket(${UUID},127.0.0.1:9106)
- same => n,Hangup()
-
 ; The PAP2T Line 2 dials this extension (any digits work; see dialplan below)
 exten => _X.,1,NoOp(Dial-up modem call from ${CALLERID(num)} to ${EXTEN})
  same => n,Set(UUID=${SHELL(uuidgen)})
- same => n,Set(JITTERBUFFER(fixed)=200,1000)
  same => n,Answer()
  same => n,AudioSocket(${UUID},127.0.0.1:9092)
  same => n,Hangup()
@@ -29,12 +20,10 @@ exten => _X.,1,NoOp(Dial-up modem call from ${CALLERID(num)} to ${EXTEN})
 ; If you want the classic "modem extension", e.g. 555:
 exten => 555,1,NoOp(Dial-up modem call)
  same => n,Set(UUID=${SHELL(uuidgen)})
- same => n,Set(JITTERBUFFER(fixed)=200,1000)
  same => n,Answer()
  same => n,AudioSocket(${UUID},127.0.0.1:9092)
  same => n,Hangup()
 
 [from-pap2t]
-exten => *995551023,1,Goto(modem-incoming,5551023,1)
 ; Route calls arriving from the PAP2T (line 2) to the modem handler
 exten => _X.,1,Goto(modem-incoming,${EXTEN},1)

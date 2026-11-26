@@ -16,10 +16,6 @@ typedef struct {
     uint8_t bits[SM_BITQ_SIZE];
     uint32_t head;
     uint32_t tail;
-    /* Stop bits per character; 0 means 1. Two give a receiver that locked
-       onto the wrong bit phase in back-to-back text an idle mark to resync
-       on, which some callers' V.23 receivers need and never get otherwise. */
-    uint8_t stop_bits;
 } sm_bitq_t;
 
 void sm_bitq_init(sm_bitq_t *q);

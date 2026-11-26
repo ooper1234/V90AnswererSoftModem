@@ -83,63 +83,7 @@ const PHASE4_FLOOR: f64 = 12.0;
 const R_BAR_GUARD: f64 = 0.1;
 
 /// TRN2d: "a minimum of 2040T" (9.4.1.2), in whole frames.
-pub(super) const TRN2D_FRAMES: usize = 340;
-
-/// TRN2d's upper bound in a rate renegotiation, 16008T (9.8.1.1.2), in
-/// whole frames.
-pub(super) const TRN2D_MAX_FRAMES: usize = 16008 / 6;
-/// The round trip, in seconds, from which MP' goes out before the analogue
-/// modem's CP is heard: a local line is a few hundred milliseconds, the
-/// SignalWire route about a second.
-const EARLY_MP_ACK_TRIP: f64 = 0.5;
-/// The round trip from which Ed goes out ahead of the analogue modem's CP.
-/// A CX93001 sends CP' and E 0.18 s after its first CP and gives up 0.8 s
-/// after the E (2026-11-15, 1.10 s round trip), so an Ed answering CP' is
-/// 1.1 s late. Where the early Ed reached it, in its own time after its first
-/// CP: 0.14 s and 0.25 s, data mode; 0.22 s and 0.55 s, tone A at once.
-const EARLY_ED_TRIP: f64 = 0.9;
-/// When the early Ed is to reach the modem, in its own time. After it sent
-/// its CPt: data mode at 3.27, 3.28 and 3.29 s; tone A at 3.19 (twice), 3.24
-/// and 3.57 s (2026-11-15, round trips 1.02 to 1.19 s). The Ed leaves this
-/// end that less a round trip after the CPt came: path-independent, as the
-/// CPt went out a one-way trip before it came and the Ed takes one more.
-/// In a rate renegotiation, after this end's Rd, which the modem has the same
-/// one-way trip after us as the Ed: 0.75 s three times in data mode, 0.51 s
-/// left it without our MP.
-/// pcmup55 at 3.30 s: data mode once (CPt to CP 3.11 s, the Ed 0.19 s after
-/// the CP), tone A once (CPt to CP 3.15 s, the Ed 0.15 s after the CP, before
-/// the modem's E at 0.18 s). The renegotiations' Eds came 0.19 to 0.28 s
-/// after the CP, all data mode. So the Ed must reach the modem after its E:
-/// 3.40 s keeps it 0.25 to 0.29 s after the CP at the gaps seen.
-/// pcmup56 at 3.40 s: CPt to CP 3.06 and 3.02 s on one call, the Ed 0.35
-/// and 0.39 s after the CP, tone A just after B1 both times. The window is
-/// about 0.17 to 0.30 s after the CP, and the gap varies 3.02 to 3.15 s
-/// between calls, so a fixed aim only does for the first try: 3.33 s puts
-/// the Ed 0.18 to 0.31 s after the CP over that range. Later tries in the
-/// call aim from the gap the modem has shown (see [`ED_AFTER_FIRST_CP`]).
-const ED_AT_MODEM_AFTER_CPT: f64 = 3.33;
-/// Where the early Ed lands after the modem's first CP once its gap from
-/// CPt to CP is known: the middle of what has worked (0.19 to 0.28 s). The
-/// gap held within 0.05 s across one call's tries.
-const ED_AFTER_FIRST_CP: f64 = 0.23;
-const ED_AFTER_RD: f64 = 0.755;
-/// How long CP without its acknowledge may go on after an early Ed before
-/// the modem is taken not to have our MP, and is offered MP' again.
-const EARLY_ED_PATIENCE: f64 = 0.4;
-/// After MP' again on a very long trip, when the Ed follows it: once the
-/// modem has had an MP' and answered with CP', which it does as it reads
-/// one -- so half a round trip on, plus an MP, less the half back.
-const ED_AFTER_MP_AGAIN: f64 = 0.3;
-
-/// When the early Ed goes after the CPt was heard, for a round trip and,
-/// if an earlier try in the call showed it, the modem's CPt-to-CP gap (as
-/// heard, which is the gap as sent).
-fn early_ed_after_cpt(trip: f64, cpt_to_cp: Option<f64>) -> f64 {
-    match cpt_to_cp {
-        Some(gap) => (gap + ED_AFTER_FIRST_CP - trip).max(0.2),
-        None => (ED_AT_MODEM_AFTER_CPT - trip).max(0.2),
-    }
-}
+const TRN2D_FRAMES: usize = 340;
 
 /// How long the Ed waits for the far modem's E before being sent again, in
 /// seconds, and how many times it may be sent. 9.4.2.4 makes the Ed a trigger
@@ -264,7 +208,7 @@ impl Settings {
 
 /// What goes out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Out {
+enum Out {
     Silence,
     Sd,
     SdBar,
@@ -272,9 +216,6 @@ pub(super) enum Out {
     Jd,
     JdPrime,
     Dil,
-    /// Scrambled ones in Jd's modulation, where no DIL was asked for (V.92
-    /// 9.5.1.1.11).
-    Scr,
     Ri,
     RiBar,
     Rd,
@@ -288,7 +229,7 @@ pub(super) enum Out {
 
 impl Out {
     /// The signal's own name, for the transcript.
-    pub(super) fn name(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             Out::Silence => "silence",
             Out::Sd => "Sd",
@@ -297,7 +238,6 @@ impl Out {
             Out::Jd => "Jd",
             Out::JdPrime => "Jd'",
             Out::Dil => "DIL",
-            Out::Scr => "SCR",
             Out::Ri => "Ri",
             Out::RiBar => "R-bar-i",
             Out::Rd => "Rd",
@@ -313,63 +253,50 @@ impl Out {
 
 /// The levels the digital modem sends, one symbol at a time.
 #[derive(Debug, Clone)]
-pub(super) struct Source {
-    pub(super) law: Law,
-    pub(super) uinfo: u8,
-    pub(super) out: Out,
+struct Source {
+    law: Law,
+    uinfo: u8,
+    out: Out,
     /// Symbols since Sd began: where in its data frame each one falls.
-    pub(super) symbol: u64,
+    symbol: u64,
     /// Symbols of the current signal sent, or for a signal made of data
     /// frames, frames of it mapped.
-    pub(super) count: usize,
-    pub(super) pending: Option<Out>,
-    pub(super) after_jd_prime: Out,
-    pub(super) scrambler: Scrambler,
+    count: usize,
+    pending: Option<Out>,
+    after_jd_prime: Out,
+    scrambler: Scrambler,
     /// Jd's differential encoder.
-    pub(super) sign: bool,
-    pub(super) jd: Vec<bool>,
-    pub(super) bits: VecDeque<bool>,
-    pub(super) dil: Vec<(u8, bool)>,
+    sign: bool,
+    jd: Vec<bool>,
+    bits: VecDeque<bool>,
+    dil: Vec<(u8, bool)>,
     /// Where each DIL segment ends, in symbols of a pass.
-    pub(super) dil_ends: Vec<usize>,
-    pub(super) frame: VecDeque<f64>,
-    pub(super) encoder: Option<Encoder>,
-    pub(super) training: Option<Mapping>,
-    pub(super) data_mode: Option<Mapping>,
-    pub(super) mp: Option<Mp>,
+    dil_ends: Vec<usize>,
+    frame: VecDeque<f64>,
+    encoder: Option<Encoder>,
+    training: Option<Mapping>,
+    data_mode: Option<Mapping>,
+    mp: Option<Mp>,
     /// Whether MP' is what goes out from the next sequence, and whether the
     /// one going out is; and how many MP' have gone whole.
-    pub(super) mp_ack: bool,
-    pub(super) sending_acknowledged: bool,
-    pub(super) acknowledged: usize,
+    mp_ack: bool,
+    sending_acknowledged: bool,
+    acknowledged: usize,
     /// Whole MPs of either kind sent since MP began.
-    pub(super) mps_sent: usize,
+    mps_sent: usize,
     /// Rd's codeword in each interval.
-    pub(super) r_codes: [u8; INTERVALS],
-    pub(super) data: VecDeque<bool>,
-    pub(super) trn1d_symbols: usize,
+    r_codes: [u8; INTERVALS],
+    data: VecDeque<bool>,
+    trn1d_symbols: usize,
     /// The last signal `start` moved to, for the transcript to notice.
-    pub(super) changed: Option<Out>,
+    changed: Option<Out>,
     /// A signal change waiting for the shaper to give up the last frame of
     /// the one before it (see `frame_boundary_change`).
-    pub(super) flush_then: Option<Out>,
-    /// V.92 PCM upstream: SUVd or CPd, repeated in MP's place in phase 4,
-    /// and one CPd to go once before them (9.6.1.1.2).
-    pub(super) up_info: Option<Vec<bool>>,
-    pub(super) up_once: Option<Vec<bool>>,
-    /// V.92 9.6.1.1.1: TRN2d goes on past its minimum until this end is
-    /// ready to receive CPu, which is when it has its CPd designed.
-    pub(super) hold_trn2d: bool,
-    /// The fewest frames TRN2d runs: TRN2D_FRAMES, or more in a rate
-    /// renegotiation (pcmup's RENEG_TRN2D_DEFAULT).
-    pub(super) trn2d_min: usize,
-    /// An Ed sent ahead of the far end's CP goes on, zeros, until the CP
-    /// gives B1d its mapping.
-    pub(super) hold_ed: bool,
+    flush_then: Option<Out>,
 }
 
 impl Source {
-    pub(super) fn new(law: Law, uinfo: u8, jd: Jd, trn1d: f64) -> Self {
+    fn new(law: Law, uinfo: u8, jd: Jd, trn1d: f64) -> Self {
         Self {
             trn1d_symbols: (trn1d * FS) as usize,
             changed: None,
@@ -398,11 +325,6 @@ impl Source {
             mps_sent: 0,
             r_codes: [0; INTERVALS],
             data: VecDeque::new(),
-            up_info: None,
-            up_once: None,
-            hold_trn2d: false,
-            trn2d_min: TRN2D_FRAMES,
-            hold_ed: false,
         }
     }
 
@@ -410,8 +332,7 @@ impl Source {
         ucode::level(self.law, ucode) * if positive { 1.0 } else { -1.0 }
     }
 
-    pub(super) fn start(&mut self, out: Out) {
-        let from = self.out;
+    fn start(&mut self, out: Out) {
         if self.out != out {
             self.changed = Some(out);
         }
@@ -438,11 +359,6 @@ impl Source {
                 self.scrambler.reset();
                 self.encoder = self.data_mode.clone().map(|m| Encoder::new(m, self.law));
             }
-            // MP' again after Ed went unread: it goes in TRN2d's mapping,
-            // which B1d replaced (8.6.1).
-            Out::Mp if matches!(from, Out::Ed | Out::B1d | Out::Data) => {
-                self.encoder = self.training.clone().map(|m| Encoder::new(m, self.law));
-            }
             _ => {}
         }
     }
@@ -452,11 +368,11 @@ impl Source {
     }
 
     /// Change to `out` at the next place the current signal can end.
-    pub(super) fn change(&mut self, out: Out) {
+    fn change(&mut self, out: Out) {
         self.pending = Some(out);
     }
 
-    pub(super) fn next(&mut self) -> f64 {
+    fn next(&mut self) -> f64 {
         let level = self.next_level();
         if self.out != Out::Silence {
             self.symbol += 1;
@@ -535,17 +451,6 @@ impl Source {
                     let (u, positive) = self.dil[at];
                     return self.level(u, positive);
                 }
-                Out::Scr => {
-                    if self.count.is_multiple_of(INTERVALS)
-                        && let Some(next) = self.pending.take()
-                    {
-                        self.start(next);
-                        continue;
-                    }
-                    self.count += 1;
-                    self.sign ^= self.scrambler.scramble(true);
-                    return self.level(self.uinfo, self.sign);
-                }
                 Out::Ri | Out::RiBar | Out::Rd | Out::RdBar => {
                     let bar = matches!(self.out, Out::RiBar | Out::RdBar);
                     if self.at_frame_boundary() {
@@ -607,7 +512,7 @@ impl Source {
             return true;
         }
         let next = match self.out {
-            Out::Trn2d if self.count >= self.trn2d_min.max(TRN2D_FRAMES) && !self.hold_trn2d => Some(Out::Mp),
+            Out::Trn2d if self.count >= TRN2D_FRAMES => Some(Out::Mp),
             Out::Mp if self.bits.is_empty() => {
                 if self.count > 0 {
                     self.mps_sent += 1;
@@ -617,23 +522,16 @@ impl Source {
                 }
                 let next = self.pending.take();
                 if next.is_none() {
+                    // A whole MP, or MP' once the far end's CP has come.
+                    let mp = self.mp.unwrap_or_default();
+                    let mp = if self.mp_ack { mp.acknowledged() } else { mp };
                     let frame_bits = self.encoder.as_ref().map_or(1, Encoder::frame_bits);
                     self.sending_acknowledged = self.mp_ack;
-                    if let Some(info) = self.up_once.take().or_else(|| self.up_info.clone()) {
-                        // V.92: SUVd or CPd, a whole number of frames.
-                        let mut info = info;
-                        info.resize(info.len().div_ceil(frame_bits.max(1)) * frame_bits.max(1), false);
-                        self.bits.extend(info);
-                    } else {
-                        // A whole MP, or MP' once the far end's CP has come.
-                        let mp = self.mp.unwrap_or_default();
-                        let mp = if self.mp_ack { mp.acknowledged() } else { mp };
-                        self.bits.extend(sequences::mp_bits(&mp, frame_bits));
-                    }
+                    self.bits.extend(sequences::mp_bits(&mp, frame_bits));
                 }
                 next
             }
-            Out::Ed if self.count >= ED_FRAMES && !self.hold_ed && self.data_mode.is_some() => Some(Out::B1d),
+            Out::Ed if self.count == ED_FRAMES => Some(Out::B1d),
             Out::B1d if self.count == B1D_FRAMES => Some(Out::Data),
             // Consume the request before flushing: otherwise it survives into MP.
             Out::Data => self.pending.take(),
@@ -962,12 +860,6 @@ pub struct Modem {
     md_until: Option<u64>,
     md_waited: bool,
     descriptor: Option<Descriptor>,
-    /// When the S-bar now awaited in phase 3 was asked for: J'd going
-    /// out, then the first S-bar. Neither answer is back sooner than a
-    /// round trip.
-    dil_asked_at: u64,
-    /// The line's round trip from the echo canceller's lock, if it has one.
-    line_round_trip: Option<f64>,
     cpt: Option<Cp>,
     cp: Option<Cp>,
     /// The last CP that was accepted, kept past the renegotiation that takes
@@ -1017,16 +909,6 @@ pub struct Modem {
     /// When the Ed last went out, and how many times it has been offered.
     ed_at: Option<u64>,
     ed_tries: u32,
-    /// When an Ed ahead of the CP is due on a very long round trip, and
-    /// whether the one out went that way.
-    early_ed_at: Option<u64>,
-    ed_early: bool,
-    /// When this phase 4's first CP came.
-    first_cp_at: Option<u64>,
-    /// When this phase 4's CPt came, and the gap from CPt to first CP that
-    /// the modem has shown on this call (kept across start-ups by the caller).
-    cpt_heard_at: Option<u64>,
-    cpt_to_cp: Option<f64>,
     /// The longest run of ones the E search has come to, when, and how many
     /// E sequences have been read whole.
     e_near: usize,
@@ -1041,9 +923,6 @@ pub struct Modem {
     /// The analogue modem's S after Ja, and when it has to have come by.
     s_heard: bool,
     jd_listening: bool,
-    /// When Jd began, and whether an S too soon to answer it was mentioned.
-    jd_at: u64,
-    early_s_said: bool,
     s_deadline: Option<u64>,
     /// The analogue modem's S and S-bar, which begin or answer a rate
     /// renegotiation (9.6.1.2); whether S-bar has been heard in this one.
@@ -1058,31 +937,13 @@ pub struct Modem {
     /// The upstream no faster than this, as a multiple of 2400, from a
     /// renegotiation this end began.
     upstream_cap: Option<u8>,
-    /// V.92 PCM upstream, which takes over everything when INFO1a asked for
-    /// it (Table 18).
-    pcm: Option<Box<super::pcmup::Machine>>,
-    /// Downstream symbols still to leave out (`slip_downstream`).
-    down_slips: u32,
 }
 
 impl Modem {
-    /// Phase 3 for V.92 PCM upstream, from INFO1a's Table 18 request.
-    pub fn new_pcm_upstream(settings: Settings, request: crate::v92::PcmUpstreamRequest) -> Self {
-        let mut modem = Self::new(settings);
-        modem.pcm = Some(Box::new(super::pcmup::Machine::new(&settings, request)));
-        modem.deadline = None;
-        modem
-    }
-
-    /// Whether this is a V.92 PCM upstream start-up.
-    pub fn pcm_upstream(&self) -> bool {
-        self.pcm.is_some()
-    }
-
     /// Phase 3 from its start: the moment INFO1a has arrived.
     pub fn new(settings: Settings) -> Self {
         let mut rx = Receiver::new(settings.upstream, FS);
-        rx.hunt_full_s();
+        rx.hunt();
         let mut modem = Self {
             settings,
             now: 0,
@@ -1101,8 +962,6 @@ impl Modem {
             md_until: None,
             md_waited: false,
             descriptor: None,
-            dil_asked_at: 0,
-            line_round_trip: None,
             cpt: None,
             cp: None,
             far_e: false,
@@ -1130,11 +989,6 @@ impl Modem {
             last_stage: Stage::AwaitS,
             ed_at: None,
             ed_tries: 0,
-            early_ed_at: None,
-            ed_early: false,
-            first_cp_at: None,
-            cpt_heard_at: None,
-            cpt_to_cp: None,
             e_near: 0,
             e_near_at: 0,
             e_read: 0,
@@ -1143,8 +997,6 @@ impl Modem {
             retry_at: None,
             s_heard: false,
             jd_listening: false,
-            jd_at: 0,
-            early_s_said: false,
             s_deadline: None,
             s_watch: SWatch::default(),
             far_s_bar: false,
@@ -1154,8 +1006,6 @@ impl Modem {
             clearing: false,
             renegotiations: 0,
             upstream_cap: None,
-            pcm: None,
-            down_slips: 0,
         };
         // 9.4.1: B1 "within 15 s plus 5 round-trip delays after receiving
         // INFO1a".
@@ -1168,20 +1018,17 @@ impl Modem {
     }
 
     pub fn status(&self) -> Status {
-        if let Some(p) = &self.pcm { return p.status(); }
         self.status
     }
 
     /// Whether the analogue modem's signal is there: in data mode, or in a
     /// renegotiation begun from it.
     pub fn carrier(&self) -> bool {
-        if let Some(p) = &self.pcm { return p.carrier(); }
         self.watching().is_some()
     }
 
     /// Whether the call ended because the analogue modem stopped sending.
     pub fn far_end_went(&self) -> bool {
-        if self.pcm.is_some() { return false; }
         self.far_end_went
     }
 
@@ -1197,7 +1044,6 @@ impl Modem {
     }
 
     pub fn phase(&self) -> &'static str {
-        if let Some(p) = &self.pcm { return p.phase(); }
         match self.stage {
             Stage::AwaitS | Stage::Training | Stage::ReadJa => "V.90 phase 3: training",
             Stage::SendJd => "V.90 phase 3: Jd",
@@ -1211,7 +1057,6 @@ impl Modem {
 
     /// The DIL the analogue modem asked for.
     pub fn descriptor(&self) -> Option<&Descriptor> {
-        if let Some(p) = &self.pcm { return p.descriptor(); }
         self.descriptor.as_ref()
     }
 
@@ -1224,7 +1069,6 @@ impl Modem {
     }
 
     pub fn phase3_snr(&self) -> Option<f64> {
-        if let Some(p) = &self.pcm { return p.phase3_snr(); }
         self.phase3_snr
     }
 
@@ -1255,49 +1099,28 @@ impl Modem {
     }
 
     pub fn take_bits(&mut self) -> Vec<bool> {
-        if let Some(p) = self.pcm.as_mut() { return p.take_bits(); }
         std::mem::take(&mut self.received)
     }
 
     /// Whether V.90's phase 2 should be run again: read once, and cleared.
-    /// The line's round trip as the echo canceller measured it, when it has
-    /// a confident lock.
-    pub fn set_line_round_trip(&mut self, seconds: f64) {
-        self.line_round_trip = (seconds > 0.0).then_some(seconds);
-    }
-
-    /// The modem's gap from CPt to its first CP, as a start-up of this call
-    /// measured it (see [`ED_AFTER_FIRST_CP`]); handed to the next start-up.
-    pub fn cpt_to_cp(&self) -> Option<f64> {
-        self.cpt_to_cp
-    }
-
-    pub fn set_cpt_to_cp(&mut self, seconds: f64) {
-        self.cpt_to_cp = (2.5..4.0).contains(&seconds).then_some(seconds);
-    }
-
     pub fn take_retrain(&mut self) -> bool {
-        if let Some(p) = self.pcm.as_mut() { return p.take_retrain(); }
         std::mem::take(&mut self.wants_retrain)
     }
 
     /// Start a retrain (9.5.1.1).
     pub fn start_retrain(&mut self) {
-        if let Some(p) = self.pcm.as_mut() { return p.start_retrain(); }
         self.retrain_why = Some("asked for by the modem above");
         self.wants_retrain = true;
     }
 
     /// What asked for the retrain, once one has been asked for.
     pub fn retrain_why(&self) -> Option<&'static str> {
-        if let Some(p) = &self.pcm { return p.retrain_why(); }
         self.retrain_why
     }
 
     /// What phases 3 and 4 have done, a line each, kept until whoever is
     /// above takes them.
     pub fn take_trace(&mut self) -> Vec<String> {
-        if let Some(p) = self.pcm.as_mut() { self.trace.extend(p.take_trace()); }
         std::mem::take(&mut self.trace)
     }
 
@@ -1320,7 +1143,6 @@ impl Modem {
     /// because a line loud with this end's own transmission is loud in every
     /// window.
     pub fn far_end_silent(&self) -> bool {
-        if let Some(p) = &self.pcm { return p.echo_training_window(); }
         self.stage == Stage::AwaitSecondReversal && self.source.out == Out::Dil
     }
 
@@ -1329,45 +1151,9 @@ impl Modem {
     /// in provider captures. The FIR fit discards its delay/tap warm-up rows;
     /// selection is still checked on independent post-DIL samples.
     pub fn echo_training_window(&self) -> bool {
-        if let Some(p) = &self.pcm { return p.echo_training_window(); }
         matches!(self.stage, Stage::AwaitFirstReversal | Stage::AwaitSecondReversal)
             && self.source.out == Out::Dil
     }
-
-    /// The analogue modem silent by 9.3.2.4 while this end sends TRN1d and
-    /// Jd and listens for its S (9.3.2.7): the line carries only this end's
-    /// own transmission coming back.
-    pub fn awaiting_s(&self) -> bool {
-        self.pcm.is_none()
-            && self.stage == Stage::SendJd
-            && matches!(self.source.out, Out::Trn1d | Out::Jd)
-            && !self.s_heard
-    }
-
-    /// From TRN1d to phase 4: the line carries this end's own TRN1d, Jd, J'd
-    /// and DIL coming back and, from the analogue modem, silence and then S
-    /// and its reversals. A filter that adds to the line here is left out
-    /// (the ffi's `Echo::do_no_harm`).
-    pub fn echo_judged(&self) -> bool {
-        self.pcm.is_none()
-            && match self.stage {
-                Stage::SendJd => matches!(self.source.out, Out::Trn1d | Out::Jd | Out::JdPrime | Out::Dil),
-                Stage::AwaitFirstReversal | Stage::AwaitSecondReversal => true,
-                _ => false,
-            }
-    }
-
-    /// A zero-DIL Quick Connect caller stops Ja upon Sd/S-bar-d and stays
-    /// silent until Jd. Wait a round trip plus settling before using TRN1d
-    /// to measure echo; that call will not provide the usual DIL window.
-    pub fn quick_echo_training_window(&self)->bool {
-        if self.pcm.is_some() { return false; }
-        self.stage==Stage::SendJd && self.source.out==Out::Trn1d
-            && self.descriptor.as_ref().is_some_and(|d| d.is_empty())
-            && self.source.count>((self.settings.round_trip+0.080)*FS) as usize
-    }
-    pub fn received_cp_sequences(&self) -> usize { self.cps.tally().1 }
-
     fn cp_tally(&self) -> String {
         let (seen, taken) = self.cps.tally();
         format!("CP sequences: {seen} begun, {taken} parsed, loudest arrival {:.4}", self.far_peak)
@@ -1393,7 +1179,6 @@ impl Modem {
     /// analogue modem to send no faster than `upstream`, a multiple of 2400.
     /// False, and nothing done, outside data mode.
     pub fn renegotiate(&mut self, upstream: u8) -> bool {
-        if self.pcm.is_some() { let _ = upstream; return false; }
         if !self.in_data_mode() {
             return false;
         }
@@ -1402,48 +1187,9 @@ impl Modem {
         true
     }
 
-    /// Begin a rate renegotiation from this end on a PCM upstream link
-    /// (V.92 9.8.1.1; see `pcmup::Machine::renegotiate`). False on any other
-    /// link or outside data mode.
-    pub fn renegotiate_pcm_up(&mut self, why: &str) -> bool {
-        self.pcm.as_mut().is_some_and(|p| p.renegotiate(why))
-    }
-
-    /// The last PCM-upstream rate renegotiation was the analogue modem's.
-    pub fn renegotiated_by_peer(&self) -> bool {
-        self.pcm.as_ref().is_some_and(|p| p.renegotiated_by_peer())
-    }
-
-    /// Leave one downstream symbol out (PCM upstream data mode only; see
-    /// `pcmup::Machine::slip_downstream`).
-    pub fn slip_downstream(&mut self) -> bool {
-        if let Some(p) = self.pcm.as_mut() {
-            return p.slip_downstream();
-        }
-        // The same over V.34 upstream: the analogue modem's downstream data
-        // frames are the same 6-symbol frames, kept across a renegotiation.
-        if self.stage != Stage::Data || !matches!(self.status, Status::Connected { .. }) {
-            return false;
-        }
-        self.down_slips += 1;
-        self.say("downstream slipped by one symbol");
-        true
-    }
-
-    /// Recover framing using measured duplex quality, not the earlier
-    /// half-duplex training peak. A healthy path can retain the same rate.
-    pub fn recover_upstream_rate(&mut self, current: u8) -> bool {
-        if self.pcm.is_some() { let _ = current; return false; }
-        if !self.in_data_mode() { return false; }
-        let snr = self.rx.snr_db();
-        let target = recovery_upstream_limit(snr, self.settings.upstream.baud(), current);
-        self.say(format!("receive recovery: measured SNR {snr:.1}dB, upstream limit {} -> {} bit/s", current as u32*2400, target as u32*2400));
-        self.renegotiate(target)
-    }
     /// End the call from data mode (9.7): a renegotiation whose MP asks for
     /// nothing. False, and nothing done, outside data mode.
     pub fn clear_down(&mut self) -> bool {
-        if self.pcm.is_some() { return false; }
         if !self.in_data_mode() {
             return false;
         }
@@ -1457,12 +1203,10 @@ impl Modem {
     }
 
     pub fn send_bits(&mut self, bits: &[bool]) {
-        if let Some(p) = self.pcm.as_mut() { return p.send_bits(bits); }
         self.source.data.extend(bits.iter().copied());
     }
 
     pub fn pending_bits(&self) -> usize {
-        if let Some(p) = &self.pcm { return p.pending_bits(); }
         self.source.data.len()
     }
 
@@ -1541,13 +1285,12 @@ impl Modem {
 
     /// One network sample in, one out.
     pub fn step(&mut self, input: f64) -> f64 {
-        if let Some(p) = self.pcm.as_mut() { self.now += 1; return crate::dprof!("pcm", p.step(input)); }
         self.now += 1;
         if let Some(mut f) = rx_dump() {
             let _ = writeln!(f, "{} {:?} {:.6}", self.now, self.stage, input);
         }
         self.far_peak = self.far_peak.max(input.abs());
-        crate::dprof!("rx feed", self.rx.feed(input));
+        self.rx.feed(input);
         // V90_DATA_AT, in seconds after this modem's V.90 started, starts data
         // mode on the clock whether or not E and B1 were read. The counterpart
         // of V34_DATA_AT, for the same reason: a replay of a recording gets to
@@ -1676,7 +1419,7 @@ impl Modem {
         }
         match self.watching() {
             Some(learn) => {
-                crate::dprof!("far end", self.far_end.feed(input, learn));
+                self.far_end.feed(input, learn);
                 if self.far_end.gone() {
                     // A far end that has hung up says nothing first. Nothing
                     // more goes to it, and the call is over, as if it had
@@ -1688,8 +1431,7 @@ impl Modem {
             None => self.far_end.reset(),
         }
         // 9.3.1, 9.4.1 and 9.6.1: tone A is the analogue modem retraining.
-        self.retrain_watch.far_peak(self.far_peak);
-        if self.stage != Stage::Finished && crate::dprof!("tone A watch", self.retrain_watch.feed(input, FS)) {
+        if self.stage != Stage::Finished && self.retrain_watch.feed(input, FS) {
             self.retrain_why = Some("Tone A from the analogue modem (9.5.2.1)");
             if let Some((on, off, held)) = self.retrain_watch.took() {
                 self.say(format!(
@@ -1701,17 +1443,16 @@ impl Modem {
             }
             self.wants_retrain = true;
         }
-        while let Some(heard) = crate::dprof!("rx heard", self.rx.heard()) {
+        while let Some(heard) = self.rx.heard() {
             if self.stage != Stage::Finished {
-                crate::dprof!("heard", self.heard(heard));
+                self.heard(heard);
             }
         }
         if let Some(until) = self.md_until
             && self.now >= until
         {
             self.md_until = None;
-            // 9.3.1.1: MD, then S and S-bar again.
-            self.rx.hunt_full_s();
+            self.rx.hunt();
         }
         if let Some((at, why)) = self.deadline
             && self.now > at
@@ -1724,12 +1465,8 @@ impl Modem {
             self.say(format!("{why}: retrain. {}", self.cp_tally()));
             self.wants_retrain = true;
         }
-        crate::dprof!("stage", self.stage_step());
-        if self.down_slips > 0 && self.stage == Stage::Data && self.source.out == Out::Data {
-            self.down_slips -= 1;
-            let _ = self.source.next();
-        }
-        let out = crate::dprof!("source", self.source.next());
+        self.stage_step();
+        let out = self.source.next();
         if let Some(sig) = self.source.changed.take() {
             self.say(format!("going out: {}", sig.name()));
         }
@@ -1756,13 +1493,8 @@ impl Modem {
         self.source.sending_acknowledged = false;
         self.source.acknowledged = 0;
         self.source.mps_sent = 0;
-        self.early_ed_at = None;
-        self.ed_early = false;
-        self.first_cp_at = None;
-        self.source.hold_ed = false;
         if initiating {
             self.source.change(Out::Rd);
-            self.arm_long_trip(ED_AFTER_RD);
         }
         self.far_e = false;
         self.far_s_bar = false;
@@ -1792,7 +1524,6 @@ impl Modem {
     fn heard_far_s_bar(&mut self) {
         if self.renegotiating && self.source.out == Out::Data && self.source.pending.is_none() {
             self.source.change(Out::Rd);
-            self.arm_long_trip(ED_AFTER_RD);
             let rd = (RD_SYMBOLS + (R_BAR_FRAMES + 1) * INTERVALS) as f64 / FS;
             self.deadline = Some((self.samples(RENEGOTIATION_E + 2.0 * self.settings.round_trip + rd),
                 "no E in the rate renegotiation"));
@@ -1826,8 +1557,6 @@ impl Modem {
                     self.rx.hunt();
                     self.s_heard = false;
                     self.jd_listening = true;
-                    self.jd_at = self.now;
-                    self.early_s_said = false;
                 }
                 if self.source.out == Out::Trn1d && self.s_deadline.is_none() {
                     let trip = if self.settings.habits.s_wait_counts_round_trip { self.settings.round_trip } else { 0.0 };
@@ -1841,7 +1570,6 @@ impl Modem {
                     self.source.change(Out::JdPrime);
                     self.say("the analogue modem's S is here: Jd' going out");
                     self.stage = Stage::AwaitFirstReversal;
-                    self.dil_asked_at = self.now;
                 } else if self.s_deadline.is_some_and(|at| self.now > at) {
                     // "... it shall initiate a retrain."
                     self.s_deadline = None;
@@ -1865,7 +1593,6 @@ impl Modem {
                     self.say("CP acknowledged but E missed: verifying upstream data framing");
                     self.start_upstream_acquisition();
                 }
-                self.early_ed_due();
                 // 9.4.1.4: an MP' sent, and CP' or E heard.
                 let heard_back = self.cp.as_ref().is_some_and(|cp| cp.acknowledge) || self.far_e;
                 if self.source.out == Out::Mp && self.source.acknowledged >= 1 && heard_back && self.source.pending.is_none() {
@@ -1942,20 +1669,6 @@ impl Modem {
     fn heard(&mut self, heard: Heard) {
         match heard {
             Heard::S if self.stage == Stage::SendJd && self.source.out == Out::Jd => {
-                // The S that answers Jd cannot be back sooner than Jd can
-                // reach the analogue modem: what the hunt takes for S before
-                // then is this end's TRN1d coming back as echo (calls 13 and
-                // 15 of 2026-11-15, 34 ms into Jd). Keep hunting; a real S
-                // goes on until J'd, so it is found again.
-                if !self.s_heard && self.now < self.jd_at + (self.soonest_answer() * FS) as u64 {
-                    if !self.early_s_said {
-                        self.early_s_said = true;
-                        self.say(format!("an S {:.0} ms into Jd, sooner than a round trip: not the answer",
-                            self.now.saturating_sub(self.jd_at) as f64 * 1000.0 / FS));
-                    }
-                    self.rx.hunt();
-                    return;
-                }
                 if !self.s_heard {
                     self.say("the analogue modem's S heard");
                 }
@@ -1980,44 +1693,7 @@ impl Modem {
         }
     }
 
-    /// The soonest an answer to something sent just now can be back: half a
-    /// round trip, taken at 0.8 of itself since a retrain's phase 2 can
-    /// measure the trip short, or 0.9 of the line's echo round trip, never
-    /// past 0.9 of phase 2's own figure.
-    fn soonest_answer(&self) -> f64 {
-        let trip = self.settings.round_trip;
-        let line = self.line_round_trip.map_or(0.0, |line| 0.9 * line.min(trip));
-        (0.4 * trip).max(line)
-    }
-
     fn reversal(&mut self, at: u64) {
-        // The first S-bar answers J'd, so it cannot be sent before J'd has
-        // reached the analogue modem: half a round trip, taken at 0.8 of
-        // itself since a retrain's phase 2 can measure the trip short. The
-        // DIL goes out with J'd, so the S-bar that ends it answers nothing
-        // newer: it only follows "S for 128T" (9.3.2.8) after the first.
-        let soonest = match self.stage {
-            // A line with a measured echo shows its round trip directly: J'd
-            // out and S-bar back cannot take less (QC call 3, 2026-11-09,
-            // 0.82 s line, a false reversal at 377 ms). Never past 0.9 of
-            // phase 2's own figure, so an echo lock on something else cannot
-            // hold the DIL back.
-            Stage::AwaitFirstReversal => self.soonest_answer(),
-            Stage::AwaitSecondReversal => 128.0 / self.settings.upstream.baud(),
-            _ => 0.0,
-        };
-        if matches!(self.stage, Stage::AwaitFirstReversal | Stage::AwaitSecondReversal)
-            && self.now < self.dil_asked_at + (soonest * FS) as u64
-        {
-            // (`at` counts the receiver's half-symbols; the clock here is
-            // this end's samples, and the reversal was noticed just now.)
-            // Too soon to answer J'd (or to end a DIL that has barely left):
-            // the analogue modem's S read as reversing. Keep listening.
-            self.say(format!("a reversal {:.0} ms after it was asked for, sooner than a round trip: not the answer",
-                self.now.saturating_sub(self.dil_asked_at) as f64 * 1000.0 / FS));
-            self.rx.hunt();
-            return;
-        }
         match self.stage {
             Stage::AwaitS => {
                 if self.settings.far_md > 0 && !self.md_waited {
@@ -2037,7 +1713,6 @@ impl Modem {
                     // still to come (9.3.1.6).
                     self.say("S-bar answers Jd': DIL going out");
                     self.stage = Stage::AwaitSecondReversal;
-                    self.dil_asked_at = self.now;
                     self.rx.hunt();
                 } else {
                     self.begin_phase4(at);
@@ -2074,11 +1749,6 @@ impl Modem {
         self.phase4_note = 0;
         self.ed_at = None;
         self.ed_tries = 0;
-        self.early_ed_at = None;
-        self.ed_early = false;
-        self.first_cp_at = None;
-        self.cpt_heard_at = None;
-        self.source.hold_ed = false;
         self.e_near = 0;
         self.e_near_at = 0;
         self.e_read = 0;
@@ -2352,39 +2022,6 @@ impl Modem {
         self.rx.idle();
     }
 
-    /// On a long round trip, MP' from the start; on a very long one, an Ed
-    /// ahead of the CP as well, `after` seconds from now.
-    fn arm_long_trip(&mut self, after: f64) {
-        let trip = self.line_round_trip.unwrap_or(0.0);
-        if trip >= EARLY_MP_ACK_TRIP && std::env::var("V90_EARLY_MP_ACK").as_deref() != Ok("0") {
-            self.source.mp_ack = true;
-            self.say(format!("round trip {:.2} s: MP' from the start", trip));
-        }
-        if trip >= EARLY_ED_TRIP && std::env::var("V90_EARLY_ED").as_deref() != Ok("0") {
-            self.early_ed_at = Some(self.samples(after));
-        }
-    }
-
-    /// Ed ahead of the CP on a very long round trip (see
-    /// [`EARLY_ED_TRIP`]): held, zeros, until the CP comes.
-    fn early_ed_due(&mut self) {
-        let Some(at) = self.early_ed_at else { return };
-        if self.now < at
-            || self.source.out != Out::Mp || self.source.acknowledged < 1 || self.source.pending.is_some()
-        {
-            return;
-        }
-        self.early_ed_at = None;
-        self.ed_early = true;
-        // Held only while the CP that gives B1d its mapping is still to come.
-        self.source.hold_ed = self.first_cp_at.is_none();
-        self.ed_at = Some(self.now);
-        self.ed_tries = 1;
-        self.source.change(Out::Ed);
-        self.say(format!("round trip {:.2} s: Ed ahead of the CP{}", self.line_round_trip.unwrap_or(0.0),
-            if self.source.hold_ed { ", held until it comes" } else { ", B1d straight after" }));
-    }
-
     fn heard_cp(&mut self, cp: Cp) {
         if !cp.data_mode {
             if self.stage == Stage::Phase4Cpt {
@@ -2396,18 +2033,6 @@ impl Modem {
                 self.say(format!("CPt heard: {}: R-bar-i then TRN2d going out", cp.describe()));
                 self.source.training = Some(training);
                 self.source.mp = Some(self.make_mp());
-                // 9.4.1.3 has MP' wait for the analogue modem's CP. That CP
-                // comes about 3 s after CPt, and on a long round trip the MP'
-                // then reaches the modem half a trip later still -- past the
-                // point where a CX93001 gives up and sends tone A (calls of
-                // 2026-11-15 over SignalWire, 1.0 s round trip). MP' from the
-                // start costs nothing: the modem only learns sooner that this
-                // end has what it needs, and data mode still waits for CP'.
-                // The echo canceller's measured trip, not phase 2's estimate:
-                // only a line known to be long is treated as one.
-                let trip = self.line_round_trip.unwrap_or(0.0);
-                self.cpt_heard_at = Some(self.now);
-                self.arm_long_trip(early_ed_after_cpt(trip, self.cpt_to_cp));
                 self.source.change(Out::RiBar);
                 self.rbar_at = Some(self.now);
                 self.rbar_tries += 1;
@@ -2434,56 +2059,6 @@ impl Modem {
             cp.describe()
         ));
         self.source.data_mode = Some(data_mode);
-        if self.first_cp_at.is_none() {
-            // This phase 4's first CP: an Ed still waiting to go early is
-            // the ordinary one now.
-            self.first_cp_at = Some(self.now);
-            self.early_ed_at = None;
-            if let Some(at) = self.cpt_heard_at.take() {
-                let gap = (self.now - at) as f64 / FS;
-                self.set_cpt_to_cp(gap);
-                self.say(format!("the modem's CP came {gap:.3} s after its CPt"));
-            }
-        }
-        let patience_over = self.first_cp_at
-            .is_some_and(|at| self.now > at + (EARLY_ED_PATIENCE * FS) as u64);
-        if self.source.hold_ed {
-            self.source.hold_ed = false;
-            self.say("CP heard under the early Ed: B1d going out at its rate");
-        }
-        // CP without its acknowledge after our Ed: the analogue modem no
-        // longer has our MP and is asking for it again (9.4.2.3), and Ed and
-        // data say nothing to it. Seen on a renegotiation whose Ed went
-        // unread twice; the caller sent tone A two seconds later.
-        if !cp.acknowledge
-            && self.stage == Stage::Phase4Cp
-            && self.ed_tries > 0
-            && !self.far_e
-            && (!self.ed_early || patience_over)
-            && matches!(self.source.out, Out::Ed | Out::B1d | Out::Data)
-            && self.source.pending.is_none()
-        {
-            self.say("CP without acknowledge after Ed: the analogue modem has lost our MP: MP' again");
-            self.ed_early = false;
-            // On a very long trip the Ed after this MP' goes early too, and
-            // the CPs already on their way are given the trip to stop.
-            let trip = self.line_round_trip.unwrap_or(0.0);
-            if trip >= EARLY_ED_TRIP && std::env::var("V90_EARLY_ED").as_deref() != Ok("0") {
-                self.early_ed_at = Some(self.samples(ED_AFTER_MP_AGAIN));
-                self.first_cp_at = Some(self.samples(trip));
-            }
-            self.ed_tries = 0;
-            self.ed_at = None;
-            self.acquirer = None;
-            self.blind_acquisition_started = false;
-            self.source.sending_acknowledged = false;
-            self.source.acknowledged = 0;
-            self.source.change(Out::Mp);
-            if self.renegotiating {
-                self.deadline = Some((self.samples(RENEGOTIATION_E + 2.0 * self.settings.round_trip),
-                    "no E in the rate renegotiation"));
-            }
-        }
         // 9.4.1.3: "After receiving the analogue modem's CP sequence, the
         // digital modem shall complete sending the current MP sequence, and
         // then send MP' sequences."
@@ -2538,7 +2113,6 @@ impl Modem {
     /// Recover the receive frame clock without resetting LAPM or the far end.
     /// A valid carrier can survive a whole-symbol jump with invalid framing.
     pub fn recover_upstream_framing(&mut self) -> bool {
-        if self.pcm.is_some() { return false; }
         if self.in_data_mode() && self.b1_left == 0 && self.decoder.is_some() {
             self.say("receive resynchronization: sustained invalid LAPM framing");
             self.start_upstream_acquisition();
@@ -2583,8 +2157,8 @@ impl Modem {
             if !self.acquisition_rate_recovery {
                 self.acquisition_rate_recovery = true;
                 let rate = (self.upstream_rate / 2400).clamp(2, 14) as u8;
-                if self.recover_upstream_rate(rate) {
-                    self.say("upstream frame acquisition timed out: quality-based rate renegotiation, retaining LAPM above");
+                if self.renegotiate(rate) {
+                    self.say("upstream frame acquisition timed out: same-rate renegotiation, retaining LAPM above");
                     return;
                 }
             }
@@ -2708,11 +2282,6 @@ fn upstream_with_headroom(training_snr_db: f64, baud: f64, most: u8, margin_db: 
     let bits = (1.0 + data_snr / 10f64.powf(0.6)).log2();
     ((bits * baud / 2400.0).floor() as u8).clamp(2, most)
 }
-fn recovery_upstream_limit(snr_db: f64, baud: f64, current: u8) -> u8 {
-    let current = current.clamp(2,14);
-    if !snr_db.is_finite() { return current.saturating_sub(1).max(2); }
-    upstream_with_headroom(snr_db, baud, current, 1.0)
-}
 /// Local recovery policy, measured in line samples, not wall-clock time.
 fn held_loss(since: &mut Option<u64>, now: u64, lost: bool) -> bool {
     if !lost {
@@ -2755,23 +2324,6 @@ mod tests {
         m.stage = Stage::Phase4Cpt;
         assert!(!m.echo_training_window(), "CP samples must not enter the DIL fit");
     }
-
-    #[test]
-    fn quick_connect_without_dil_measures_echo_only_after_peer_silence() {
-        use crate::v34::info::{Info1aPcm,Info1c,SymbolRate};
-        let asked=Info1aPcm {md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None};
-        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,0.300,true));
-        m.stage=Stage::SendJd; m.descriptor=Some(Descriptor::none());
-        m.source.start(Out::Trn1d); m.source.count=3000;
-        assert!(!m.quick_echo_training_window(),"peer Ja may still be returning");
-        m.source.count=3041;
-        assert!(m.quick_echo_training_window());
-        m.source.start(Out::Jd);
-        assert!(!m.quick_echo_training_window(),"peer S may answer Jd");
-        m.source.start(Out::Trn1d); m.source.count=4000;
-        m.descriptor.as_mut().unwrap().ucodes.push(79);
-        assert!(!m.quick_echo_training_window(),"ordinary DIL calls retain their existing fit");
-    }
     #[test]
     fn long_profile_starts_jd_inside_4000ms() {
         let mut source=Source::new(Law::Mu,79,Jd::default(),Habits::LIVE_SERVER.trn1d);
@@ -2781,186 +2333,6 @@ mod tests {
         assert_eq!(source.out,Out::Jd);
         assert!(samples<=4*FS as usize,"Jd started after the mandatory deadline");
         assert!(Habits::LIVE_SERVER.s_wait_counts_round_trip);
-    }
-
-    /// A live call (2026-11-03 13:34, round trip 0.9 s) took a reversal 7 ms
-    /// after J'd went out for the S-bar that answers it, and another 20 ms
-    /// later for the one that ends the DIL: 26 ms of a 119-segment DIL, then
-    /// Ri, and the analogue modem asked for a retrain, twice. The first S-bar
-    /// cannot come back sooner than J'd can reach the analogue modem, and the
-    /// second not sooner than the S before it.
-    #[test]
-    fn dil_reversals_sooner_than_a_round_trip_are_not_the_answer() {
-        use crate::v34::info::{Info1aPcm,Info1c,SymbolRate};
-        let asked=Info1aPcm{md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None};
-        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,0.9,true));
-        m.stage=Stage::SendJd;m.source.start(Out::Jd);m.stage_step();
-        m.now+=(m.settings.round_trip*FS) as u64;
-        m.heard(Heard::S);m.stage_step();
-        assert_eq!(m.stage,Stage::AwaitFirstReversal);
-        m.source.after_jd_prime=Out::Dil;
-        let jd_prime=m.now;
-        m.now=jd_prime+56;
-        m.reversal(m.now);
-        assert_eq!(m.stage,Stage::AwaitFirstReversal,"a reversal 7 ms after J'd answered it");
-        m.now=jd_prime+(0.88*FS) as u64;
-        m.reversal(m.now);
-        assert_eq!(m.stage,Stage::AwaitSecondReversal);
-        let first=m.now;
-        m.now=first+160;
-        m.reversal(m.now);
-        assert_eq!(m.stage,Stage::AwaitSecondReversal,"a reversal 20 ms on ended the DIL");
-        m.now=first+(1.0*FS) as u64;
-        m.reversal(m.now);
-        assert_eq!(m.stage,Stage::Phase4Cpt);
-    }
-
-    /// The DIL goes out straight after J'd, so the S-bar that ends it answers
-    /// nothing that crossed the line since the first: the analogue modem only
-    /// has to read the DIL and send S for 128T (9.3.2.8). Over a 1.2 s round
-    /// trip the simulated analogue modem ends a short DIL 0.49 s on.
-    #[test]
-    fn the_s_bar_that_ends_the_dil_needs_only_s_after_the_first() {
-        use crate::v34::info::{Info1aPcm,Info1c,SymbolRate};
-        let asked=Info1aPcm{md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None};
-        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,1.21,true));
-        m.stage=Stage::SendJd;m.source.start(Out::Jd);m.stage_step();
-        m.now+=(m.settings.round_trip*FS) as u64;
-        m.heard(Heard::S);m.stage_step();
-        m.source.after_jd_prime=Out::Dil;
-        let jd_prime=m.now;
-        m.now=jd_prime+(1.25*FS) as u64;
-        m.reversal(m.now);
-        assert_eq!(m.stage,Stage::AwaitSecondReversal);
-        let first=m.now;
-        m.now=first+(0.030*FS) as u64;
-        m.reversal(m.now);
-        assert_eq!(m.stage,Stage::AwaitSecondReversal,"sooner than 128T of S");
-        m.now=first+(0.49*FS) as u64;
-        m.reversal(m.now);
-        assert_eq!(m.stage,Stage::Phase4Cpt,"a DIL ended after S, sooner than a round trip");
-    }
-
-    /// A retrain's phase 2 over 0.6 s each way measured 0.79 s, and the
-    /// analogue modem's S-bar for J'd came back 0.587 s after J'd: past J'd's
-    /// one-way trip, short of the measured round trip.
-    #[test]
-    fn the_first_s_bar_needs_only_j_d_to_have_arrived() {
-        use crate::v34::info::{Info1aPcm,Info1c,SymbolRate};
-        let asked=Info1aPcm{md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None};
-        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,0.79,true));
-        m.stage=Stage::SendJd;m.source.start(Out::Jd);m.stage_step();
-        m.now+=(m.settings.round_trip*FS) as u64;
-        m.heard(Heard::S);m.stage_step();
-        m.source.after_jd_prime=Out::Dil;
-        let jd_prime=m.now;
-        m.now=jd_prime+(0.587*FS) as u64;
-        m.reversal(m.now);
-        assert_eq!(m.stage,Stage::AwaitSecondReversal);
-    }
-
-    /// QC call 3 of 2026-11-09 14:46: the line's echo said 0.82 s round
-    /// trip and a reversal 377 ms after J'd was taken as its answer; the real
-    /// S-bar came 831 ms after J'd and was taken for the DIL's end.
-    #[test]
-    fn a_far_line_s_bar_waits_for_the_echo_round_trip() {
-        use crate::v34::info::{Info1aPcm,Info1c,SymbolRate};
-        let asked=Info1aPcm{md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None};
-        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,0.9,true));
-        m.set_line_round_trip(0.82);
-        m.stage=Stage::SendJd;m.source.start(Out::Jd);m.stage_step();
-        m.now+=(m.settings.round_trip*FS) as u64;
-        m.heard(Heard::S);m.stage_step();
-        m.source.after_jd_prime=Out::Dil;
-        let jd_prime=m.now;
-        m.now=jd_prime+(0.377*FS) as u64;
-        m.reversal(m.now);
-        assert_eq!(m.stage,Stage::AwaitFirstReversal,"377 ms is sooner than the line's round trip");
-        m.now=jd_prime+(0.831*FS) as u64;
-        m.reversal(m.now);
-        assert_eq!(m.stage,Stage::AwaitSecondReversal);
-    }
-
-    /// An echo lock on something other than the line cannot stretch the wait
-    /// past 0.9 of the round trip phase 2 measured.
-    #[test]
-    fn an_echo_longer_than_phase_two_does_not_stretch_the_wait() {
-        use crate::v34::info::{Info1aPcm,Info1c,SymbolRate};
-        let asked=Info1aPcm{md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None};
-        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,0.79,true));
-        m.set_line_round_trip(2.0);
-        m.stage=Stage::SendJd;m.source.start(Out::Jd);m.stage_step();
-        m.now+=(m.settings.round_trip*FS) as u64;
-        m.heard(Heard::S);m.stage_step();
-        m.source.after_jd_prime=Out::Dil;
-        m.now+=(0.72*FS) as u64;
-        m.reversal(m.now);
-        assert_eq!(m.stage,Stage::AwaitSecondReversal);
-    }
-
-    /// Live calls 13 and 15 of 2026-11-15 (a Conexant CX93001 over a 0.87 s
-    /// round trip): the S hunt, started again with Jd, took the echo of
-    /// TRN1d for S 34 ms on. One Jd went out, then J'd and the DIL, and the
-    /// analogue modem, which never sent S, asked for a retrain 5.6 s later.
-    /// An S that answers Jd cannot come back sooner than Jd can reach the
-    /// analogue modem; the real one on call 14 came 3 s into Jd.
-    #[test]
-    fn an_s_sooner_than_a_round_trip_after_jd_is_not_the_answer() {
-        use crate::v34::info::{Info1aPcm,Info1c,SymbolRate};
-        let asked=Info1aPcm{md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None};
-        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,0.87,true));
-        m.set_line_round_trip(0.874);
-        m.stage=Stage::SendJd;m.source.start(Out::Jd);m.stage_step();
-        let jd=m.now;
-        m.now=jd+(0.034*FS) as u64;
-        m.heard(Heard::S);m.stage_step();
-        assert_eq!(m.stage,Stage::SendJd,"an S 34 ms into Jd answered it");
-        assert_eq!(m.source.pending,None);
-        m.now=jd+(3.0*FS) as u64;
-        m.heard(Heard::S);m.stage_step();
-        assert_eq!(m.source.pending,Some(Out::JdPrime));
-        assert_eq!(m.stage,Stage::AwaitFirstReversal);
-    }
-
-    /// From TRN1d to phase 4 the line holds this end's own TRN1d, Jd, J'd
-    /// and DIL coming back, with nothing from the analogue modem but S and
-    /// its reversals: the stretch where a filter left over from phase 2 is
-    /// judged against the line (call 24 of 2026-11-15, a 1.12 s SignalWire
-    /// line: three reversals inside a round trip of J'd ended a 1.1 s DIL).
-    #[test]
-    fn the_echo_is_judged_from_trn1d_to_phase_four() {
-        use crate::v34::info::{Info1aPcm,Info1c,SymbolRate};
-        let asked=Info1aPcm{md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None};
-        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,0.87,true));
-        m.stage=Stage::ReadJa;m.source.start(Out::Silence);
-        assert!(!m.echo_judged());
-        m.stage=Stage::SendJd;m.source.start(Out::Trn1d);
-        assert!(m.echo_judged());
-        m.stage=Stage::AwaitFirstReversal;m.source.start(Out::Dil);
-        assert!(m.echo_judged());
-        m.stage=Stage::AwaitSecondReversal;
-        assert!(m.echo_judged());
-        m.stage=Stage::Phase4Cpt;m.source.start(Out::Ri);
-        assert!(!m.echo_judged(),"phase 4: the far end can be far louder than the echo");
-    }
-
-    /// From S-bar-d to the S that answers Jd the analogue modem is silent
-    /// (9.3.2.4, 9.3.2.7): what arrives is this end's TRN1d and Jd coming
-    /// back, and nothing else.
-    #[test]
-    fn the_far_end_is_silent_from_trn1d_until_its_s() {
-        use crate::v34::info::{Info1aPcm,Info1c,SymbolRate};
-        let asked=Info1aPcm{md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None};
-        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,0.87,true));
-        m.stage=Stage::ReadJa;m.source.start(Out::Silence);
-        assert!(!m.awaiting_s());
-        m.stage=Stage::SendJd;m.source.start(Out::Trn1d);
-        assert!(m.awaiting_s());
-        m.source.start(Out::Jd);m.stage_step();
-        assert!(m.awaiting_s());
-        m.now+=(1.0*FS) as u64;
-        m.heard(Heard::S);
-        assert!(!m.awaiting_s(),"the analogue modem's S is on the line");
     }
 
     #[test]
@@ -2973,7 +2345,6 @@ mod tests {
         assert!(!m.s_heard,"TRN1d indication must not answer a Jd that was not sent");
         m.stage_step();assert!(!m.jd_listening);
         m.source.start(Out::Jd);m.stage_step();assert!(m.jd_listening);
-        m.now+=(m.settings.round_trip*FS) as u64;
         m.heard(Heard::S);m.stage_step();
         assert_eq!(m.source.pending,Some(Out::JdPrime));
         assert_eq!(m.stage,Stage::AwaitFirstReversal);
@@ -3000,75 +2371,6 @@ mod tests {
         assert_eq!(m.source.pending,Some(Out::Rd));
     }
 
-    /// Live 2026-11-15, pcmup48, 1.07 s round trip: data mode came up, the
-    /// CX93001 asked for a lower rate, and in that renegotiation sent tone A
-    /// 0.33 s after its CP' -- MP' and Ed were still waiting on its CP. A
-    /// renegotiation on a very long round trip does both early too, timed from
-    /// its Rd.
-    #[test]
-    fn a_very_long_round_trip_renegotiates_with_early_mp_prime_and_ed() {
-        use crate::v34::info::{Info1aPcm, Info1c, SymbolRate};
-        let asked=Info1aPcm { md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None };
-        let mask=(1u128<<88)-1;
-        for (trip, early) in [(1.07, true), (0.3, false)] {
-            let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,trip,true));
-            m.set_line_round_trip(trip);
-            let cpt=Cp {drn:9,constellations:vec![mask],..Cp::default()};
-            let cp=Cp {data_mode:true,drn:16,acknowledge:true,constellations:vec![mask],..cpt.clone()};
-            m.cpt=Some(cpt);
-            m.source.data_mode=Mapping::from_cp(&cp);
-            m.cp=Some(cp.clone());
-            // The first phase 4's early Ed is long over.
-            m.ed_early = true;
-            m.source.start(Out::Data);
-            m.stage=Stage::Data;
-            m.begin_renegotiation(false);
-            assert!(!m.ed_early, "the first phase 4's early Ed carried into the renegotiation");
-            m.heard_far_s_bar();
-            assert_eq!(m.source.mp_ack, early, "round trip {trip}: MP' from the start");
-            m.source.start(Out::Mp);
-            m.source.pending = None;
-            m.source.acknowledged = 1;
-            m.now += (ED_AFTER_RD * FS) as u64 + 1;
-            m.early_ed_due();
-            if !early {
-                assert_eq!(m.source.pending, None);
-                continue;
-            }
-            assert_eq!(m.source.pending, Some(Out::Ed));
-            m.source.start(Out::Ed);
-            m.source.pending = None;
-            m.heard_cp(Cp { drn:15, acknowledge:false, ..cp.clone() });
-            assert!(!m.source.hold_ed);
-            assert_ne!(m.source.pending, Some(Out::Mp), "CP before the modem's CP' read as a lost MP");
-            // pcmup50 with the Ed landing at 0.27 s: the renegotiation's CPs
-            // never took the acknowledge -- the modem had not read our MP --
-            // and nothing offered it again. Past the patience, MP' again.
-            m.now += (0.2 * FS) as u64;
-            m.heard_cp(Cp { drn:15, acknowledge:false, ..cp.clone() });
-            assert_ne!(m.source.pending, Some(Out::Mp), "MP' again too soon");
-            m.now += (0.3 * FS) as u64;
-            m.heard_cp(Cp { drn:15, acknowledge:false, ..cp.clone() });
-            assert_eq!(m.source.pending, Some(Out::Mp), "the modem never acknowledged: MP' again");
-            // pcmup53 13:15:50: after that MP' the Ed answered the CP', a
-            // round trip late, and the modem sent tone A. The Ed goes early
-            // again -- with B1d straight after it, the CP being known -- and
-            // the CPs already on their way do not ask for MP' a third time.
-            m.source.start(Out::Mp);
-            m.source.pending = None;
-            m.source.acknowledged = 1;
-            m.now += (0.31 * FS) as u64;
-            m.early_ed_due();
-            assert_eq!(m.source.pending, Some(Out::Ed), "no early Ed after MP' again");
-            assert!(!m.source.hold_ed, "the CP is known: nothing to hold for");
-            m.source.start(Out::Ed);
-            m.source.pending = None;
-            m.now += (0.5 * FS) as u64;
-            m.heard_cp(Cp { drn:15, acknowledge:false, ..cp.clone() });
-            assert_ne!(m.source.pending, Some(Out::Mp), "CPs in flight read as a lost MP");
-        }
-    }
-
     #[test]
     fn upstream_coding_matches_the_advertised_trellis() {
         for (setting, expected) in [(None, Code::States16), (Some("16"), Code::States16),
@@ -3076,155 +2378,6 @@ mod tests {
             (Some("invalid"), Code::States16)] {
             assert_eq!(upstream_code(requested_upstream_trellis(setting)), expected);
         }
-    }
-
-    /// Live 2026-11-15, CX93001 over SignalWire, about 1.0 s round trip:
-    /// its CP reached us 3.0 s after its CPt, so an MP' sent only on
-    /// hearing it reached the modem at +3.5 s, and the modem sent tone A at
-    /// +3.3 to +3.6 s (calls 3 and 4 after pcmup46). On a long round trip
-    /// the MP that follows TRN2d is MP' from the start.
-    #[test]
-    fn a_long_round_trip_sends_mp_prime_from_the_start() {
-        use crate::v34::info::{Info1aPcm, Info1c, SymbolRate};
-        let asked = Info1aPcm { md_length:0, uinfo:79, upstream:SymbolRate::S3200, frequency_offset:None };
-        let mask=(1u128<<88)-1;
-        let cpt = Cp { data_mode:false, drn:9, upstream_rates:0x1fff, constellations:vec![mask], ..Cp::default() };
-        for (trip, measured, early) in [(1.02, true, true), (0.35, true, false), (1.02, false, false)] {
-            let mut m = Modem::new(Settings::new(Law::Mu, &Info1c::default(), &asked, trip, true));
-            if measured { m.set_line_round_trip(trip); }
-            m.stage = Stage::Phase4Cpt;
-            m.source.start(Out::Ri);
-            m.heard_cp(cpt.clone());
-            assert_eq!(m.stage, Stage::Phase4Cp);
-            assert_eq!(m.source.mp_ack, early, "round trip {trip} s, measured {measured}");
-        }
-    }
-
-    /// Live 2026-11-15, pcmup47, CX93001 over SignalWire at 1.10 s: with
-    /// MP' from the start the modem sent CP' and E 0.18 s after its first
-    /// CP and tone A 0.80 s after the E, both attempts -- before an Ed sent
-    /// on hearing CP' could reach it. On a trip that long the Ed goes out
-    /// ahead of the CP, and holds until the CP says what B1d goes out at.
-    #[test]
-    fn a_very_long_round_trip_sends_ed_ahead_of_the_cp() {
-        use crate::v34::info::{Info1aPcm, Info1c, SymbolRate};
-        let asked = Info1aPcm { md_length:0, uinfo:79, upstream:SymbolRate::S3200, frequency_offset:None };
-        let mask=(1u128<<88)-1;
-        let cpt = Cp { data_mode:false, drn:9, upstream_rates:0x1fff, constellations:vec![mask], ..Cp::default() };
-        let cp = Cp { data_mode:true, drn:15, upstream_rates:0x1fff, constellations:vec![mask], ..Cp::default() };
-        for (trip, early) in [(1.10, true), (1.02, true), (1.19, true), (0.65, false)] {
-            let mut m = Modem::new(Settings::new(Law::Mu, &Info1c::default(), &asked, trip, true));
-            m.set_line_round_trip(trip);
-            m.stage = Stage::Phase4Cpt;
-            m.source.start(Out::Ri);
-            m.heard_cp(cpt.clone());
-            // MP' going out, one of them whole.
-            m.source.start(Out::Mp);
-            m.source.pending = None;
-            m.source.acknowledged = 1;
-            let after = early_ed_after_cpt(trip, None);
-            m.now += (after * FS) as u64 - 1;
-            m.early_ed_due();
-            assert_eq!(m.source.pending, None, "round trip {trip}: Ed before its time");
-            m.now += 2;
-            m.early_ed_due();
-            if !early {
-                assert_eq!(m.source.pending, None, "round trip {trip}: Ed early on a short trip");
-                continue;
-            }
-            assert_eq!(m.source.pending, Some(Out::Ed));
-            assert!(m.source.hold_ed);
-            // In the modem's time: after its CP' (0.18 s after its first CP)
-            // and before 0.8 s after its E.
-            // In the modem's time, after it sent its CPt: data mode at 3.27,
-            // 3.28 and 3.29 s; tone A at 3.19, 3.24 and 3.57 s.
-            let lands = after + trip;
-            assert!(lands > 3.28 && lands < 3.38, "round trip {trip}: the Ed lands {lands:.2} s after the CPt");
-            m.source.start(Out::Ed);
-            m.source.pending = None;
-            // The modem's first CP, without its acknowledge: B1d at its rate,
-            // and not "the modem has lost our MP".
-            m.heard_cp(Cp { acknowledge:false, ..cp.clone() });
-            assert!(!m.source.hold_ed);
-            assert!(m.source.data_mode.is_some());
-            assert_eq!(m.source.out, Out::Ed);
-            assert_ne!(m.source.pending, Some(Out::Mp));
-        }
-    }
-
-    /// A held Ed is zeros for as long as it is held, and B1d follows it the
-    /// frame it is let go.
-    #[test]
-    fn a_retry_aims_its_early_ed_from_the_gap_the_modem_showed() {
-        use crate::v34::info::{Info1aPcm, Info1c, SymbolRate};
-        let asked = Info1aPcm { md_length:0, uinfo:79, upstream:SymbolRate::S3200, frequency_offset:None };
-        let mask=(1u128<<88)-1;
-        let cpt = Cp { data_mode:false, drn:9, upstream_rates:0x1fff, constellations:vec![mask], ..Cp::default() };
-        let cp = Cp { data_mode:true, drn:14, upstream_rates:0x1fff, constellations:vec![mask], ..Cp::default() };
-        let trip = 1.05;
-        // First try: the fixed aim, and the gap is measured from what comes.
-        let mut m = Modem::new(Settings::new(Law::Mu, &Info1c::default(), &asked, trip, true));
-        m.set_line_round_trip(trip);
-        assert_eq!(m.cpt_to_cp(), None);
-        m.stage = Stage::Phase4Cpt;
-        m.source.start(Out::Ri);
-        m.heard_cp(cpt.clone());
-        assert_eq!(m.early_ed_at, Some(m.now + (early_ed_after_cpt(trip, None) * FS) as u64));
-        m.now += (3.062 * FS) as u64;
-        m.heard_cp(cp.clone());
-        let gap = m.cpt_to_cp().expect("the gap from CPt to CP");
-        assert!((gap - 3.062).abs() < 0.001, "gap {gap}");
-        // A CP in a renegotiation (no CPt this phase 4) measures nothing.
-        m.now += FS as u64;
-        m.heard_cp(cp.clone());
-        assert!((m.cpt_to_cp().unwrap() - 3.062).abs() < 0.001);
-        // The retry, a new modem told the gap: its Ed lands 0.23 s after the
-        // modem's first CP when the gap repeats (3.019 s on the live call).
-        let mut r = Modem::new(Settings::new(Law::Mu, &Info1c::default(), &asked, trip, true));
-        r.set_line_round_trip(trip);
-        r.set_cpt_to_cp(gap);
-        r.stage = Stage::Phase4Cpt;
-        r.source.start(Out::Ri);
-        let t0 = r.now;
-        r.heard_cp(cpt.clone());
-        let after = (r.early_ed_at.unwrap() - t0) as f64 / FS;
-        for (next_gap, lo, hi) in [(3.062, 0.22, 0.24), (3.019, 0.26, 0.28)] {
-            let lands_after_cp = after + trip - next_gap;
-            assert!(lands_after_cp > lo && lands_after_cp < hi, "gap {next_gap}: Ed {lands_after_cp:.3} s after the CP");
-        }
-        // Gaps that are not a CPt-to-CP gap are not kept.
-        r.set_cpt_to_cp(0.5);
-        assert_eq!(r.cpt_to_cp(), None);
-    }
-
-    #[test]
-    fn a_held_ed_goes_on_until_it_is_let_go() {
-        let mut source = Source::new(Law::Mu, 79, Jd::default(), 0.3);
-        source.training = Some(shaped());
-        source.mp = Some(Mp::default());
-        source.start(Out::Trn2d);
-        let mut decoder = Decoder::new(shaped());
-        let mut descrambler = Scrambler::new(Mode::Call);
-        let _ = read(&mut source, TRN2D_FRAMES + 40, &mut decoder, &mut descrambler);
-        source.hold_ed = true;
-        source.change(Out::Ed);
-        let mut zeros = 0;
-        for _ in 0..200 {
-            let frame = read(&mut source, 1, &mut decoder, &mut descrambler).remove(0);
-            zeros = if frame.iter().all(|&b| !b) { zeros + 1 } else { 0 };
-        }
-        assert!(zeros >= 150, "a held Ed stopped: {zeros} zero frames at the end");
-        assert_eq!(source.out, Out::Ed);
-        source.data_mode = Some(shaped());
-        source.hold_ed = false;
-        let mut decoder = Decoder::new(shaped());
-        let mut descrambler = Scrambler::new(Mode::Call);
-        let mut ones = 0;
-        for _ in 0..(B1D_FRAMES + 10) {
-            let frame = read(&mut source, 1, &mut decoder, &mut descrambler).remove(0);
-            if frame.iter().all(|&b| b) { ones += 1; }
-        }
-        assert!(ones >= B1D_FRAMES - 2, "B1d did not follow the held Ed: {ones} frames of ones");
     }
 
     #[test]
@@ -3268,14 +2421,6 @@ mod tests {
         assert!(m.take_retrain(), "an unsuccessful shorter recovery must fall back to full retraining");
     }
 
-    #[test]
-    fn framing_recovery_uses_duplex_quality_without_capping_healthy_calls() {
-        assert_eq!(recovery_upstream_limit(24.0,3200.0,10),7);
-        assert_eq!(recovery_upstream_limit(40.0,3200.0,12),12);
-        assert_eq!(recovery_upstream_limit(40.0,3200.0,8),8);
-        assert_eq!(recovery_upstream_limit(f64::NAN,3200.0,10),9);
-        assert_eq!(recovery_upstream_limit(-10.0,3200.0,10),2);
-    }
     #[test]
     fn training_snr_reserves_margin_for_the_data_path() {
         // The real ATA's 35 dB training / 30 dB data must not offer 28,800.
@@ -3377,95 +2522,6 @@ mod tests {
         let got: Vec<bool> = read(&mut source, sent.len() / d, &mut decoder, &mut descrambler).concat();
         assert_eq!(got[..], sent[..got.len()]);
     }
-    #[test]
-    fn a_v34_upstream_link_slips_its_downstream_by_one_symbol() {
-        // Call 2 on 2026-11-14: playout moved +640 samples (4 mod 6), the
-        // analogue modem stopped answering, and with no slip on a V.34
-        // upstream link only a full retrain was left.
-        use crate::v34::info::{Info1aPcm, Info1c, SymbolRate};
-        let asked=Info1aPcm { md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None };
-        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,0.87,true));
-        m.source.data_mode=Some(shaped());
-        m.source.start(Out::B1d);
-        m.stage=Stage::Phase4Cp;
-        assert!(!m.slip_downstream(),"nothing to slip before data mode");
-        m.stage=Stage::Data;
-        m.status=Status::Connected { downstream:46666, upstream:24000 };
-        for _ in 0..(B1D_FRAMES+2)*INTERVALS {m.source.next();}
-        assert_eq!(m.source.out,Out::Data);
-        let before=m.source.symbol;
-        assert!(m.slip_downstream());
-        for _ in 0..12 {m.step(0.0);}
-        assert_eq!(m.source.symbol-before,13,"twelve samples out, thirteen symbols spent");
-        for _ in 0..12 {m.step(0.0);}
-        assert_eq!(m.source.symbol-before,25,"one slip per request");
-    }
-
-    #[test]
-    fn an_mp_after_data_goes_out_in_the_training_mapping() {
-        let mut source = Source::new(Law::Mu, 79, Jd::default(), 0.3);
-        let mut data = shaped();
-        data.k = 20;
-        source.training = Some(shaped());
-        source.data_mode = Some(data.clone());
-        source.mp = Some(Mp::default());
-        source.start(Out::B1d);
-        for _ in 0..(B1D_FRAMES + 8) * INTERVALS { source.next(); }
-        assert_eq!(source.out, Out::Data);
-        assert_eq!(source.encoder.as_ref().map(|e| e.mapping().clone()), Some(data));
-        source.change(Out::Mp);
-        for _ in 0..64 * INTERVALS {
-            source.next();
-            if source.out == Out::Mp { break; }
-        }
-        assert_eq!(source.out, Out::Mp);
-        assert_eq!(source.encoder.as_ref().map(|e| e.mapping().clone()), Some(shaped()),
-            "MP' is read in TRN2d's mapping, not the data mode's");
-    }
-
-    /// Call 9 on 2026-11-14: the caller's CP' answered our MP', our Ed and
-    /// its repeat went unread, and the caller went back to CP without the
-    /// acknowledge bit -- it no longer had our MP -- for two seconds before
-    /// tone A. Data mode was all it heard from us in that time.
-    #[test]
-    fn a_cp_without_acknowledge_after_ed_brings_mp_prime_back() {
-        use crate::v34::info::{Info1aPcm, Info1c, SymbolRate};
-        let asked=Info1aPcm { md_length:0,uinfo:79,upstream:SymbolRate::S3200,frequency_offset:None };
-        let mut m=Modem::new(Settings::new(Law::Mu,&Info1c::default(),&asked,0.87,true));
-        let mask=(1u128<<88)-1;
-        let cpt=Cp {drn:1,constellations:vec![mask],..Cp::default()};
-        let cp=Cp {data_mode:true,acknowledge:true,drn:1,constellations:vec![mask],..cpt.clone()};
-        m.cpt=Some(cpt);
-        m.source.training=Some(shaped());
-        m.source.data_mode=Mapping::from_cp(&cp);
-        m.source.mp=Some(Mp::default());
-        m.source.mp_ack=true;
-        m.cp=Some(cp.clone());
-        m.stage=Stage::Phase4Cp;
-        m.renegotiating=true;
-        m.source.start(Out::Data);
-        m.ed_tries=ED_TRIES;
-        m.ed_at=Some(m.now);
-        m.now+=(0.25*FS) as u64;
-        m.heard_cp(Cp {acknowledge:false,..cp.clone()});
-        assert_eq!(m.source.pending,Some(Out::Mp),"the caller lost our MP: send it MP' again");
-        assert_eq!(m.ed_tries,0);
-        assert!(m.deadline.is_some_and(|(at,_)| at>m.now+(2.0*FS) as u64),"a fresh round gets a fresh E deadline");
-        for _ in 0..64*INTERVALS {
-            m.source.next();
-            if m.source.out==Out::Mp {break;}
-        }
-        assert_eq!(m.source.out,Out::Mp);
-        // A second CP without acknowledge changes nothing more.
-        m.heard_cp(Cp {acknowledge:false,..cp.clone()});
-        assert!(m.source.pending.is_none());
-        while m.source.acknowledged==0 {m.source.next();}
-        m.heard_cp(cp);
-        m.stage_step();
-        assert_eq!(m.source.pending,Some(Out::Ed),"its CP' answers the MP': Ed again");
-        assert_eq!(m.ed_tries,1);
-    }
-
     #[test]
     fn data_renegotiation_consumes_the_request_before_flushing() {
         let mut source = Source::new(Law::Mu, 79, Jd::default(), 0.3);

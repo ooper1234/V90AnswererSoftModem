@@ -314,9 +314,6 @@ impl Encoder {
     fn extension(&self, found: &Match, room: usize) -> usize {
         let node = self.nodes[usize::from(found.node)];
         let after = node.at as usize + usize::from(node.len);
-        // 7.11.4: extension ends where the history does, so the decoder's
-        // history, which is N8R long, is never over-run (Appendix II).
-        let room = room.min(self.end().saturating_sub(self.at));
         let mut n = 0usize;
         // The two runs may overlap, and that is the point: a string of one
         // character repeated is matched against itself one place along, which
@@ -340,17 +337,13 @@ impl Encoder {
         let mut level = self.root[usize::from(first)]?;
         let mut used = 1usize;
         let mut last: Option<u16> = None;
-        // 7.11.4: matching stops at the end of the history (C4 = N8T). A
-        // segment that would carry the match past it is not matched, so what
-        // the decoder copies never takes its history beyond N8R.
-        let end = self.end();
         loop {
             let mut best: Option<u16> = None;
             let mut node = Some(level);
             while let Some(index) = node {
                 let n = self.nodes[usize::from(index)];
                 let seg = &self.history[n.at as usize..n.at as usize + usize::from(n.len)];
-                let have = &self.history[(self.at + used).min(end)..end];
+                let have = &self.history[(self.at + used).min(self.history.len())..];
                 let same = seg.iter().zip(have).take_while(|(a, b)| a == b).count();
                 if same == seg.len() && same > 0 {
                     best = Some(index);
@@ -364,7 +357,7 @@ impl Encoder {
                     used += usize::from(n.len);
                     last = Some(index);
                     match n.down {
-                        Some(next) if self.at + used < end => level = next,
+                        Some(next) if self.at + used < self.history.len() => level = next,
                         _ => break,
                     }
                 }
@@ -374,12 +367,6 @@ impl Encoder {
         // 6.3.1: the match fails if "no second-level node matches the second
         // character", which is a match that never got past the root.
         last.map(|node| Match { node, used })
-    }
-
-    /// Where matching has to stop: the characters in hand, or the end of the
-    /// history (N8T), whichever comes first.
-    fn end(&self) -> usize {
-        self.history.len().min(usize::from(self.params.n8))
     }
 
     /// Whether the node-tree has room for another string-segment.
@@ -552,8 +539,6 @@ impl Encoder {
         out.push(self.escape);
         out.push(super::command::ECM);
         self.mode = Mode::Compressed;
-        // The ESCAPE is kept: 7.14 resets it only when the data compression
-        // function is initialised (7.5), and a far decoder that follows the
-        // Recommendation reads the next transparent spell with this value.
+        self.escape = 0;
     }
 }

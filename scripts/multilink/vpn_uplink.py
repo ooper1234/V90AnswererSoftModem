@@ -4,52 +4,24 @@ from pathlib import Path
 import signal
 import subprocess
 import time
-import os
-import ipaddress
-import json
 
 READY = Path('/run/v90-uplink-ready')
-RELAY = str(ipaddress.IPv4Address(os.environ.get('V90_VPN_RELAY', '27.130.93.85')))
-RELAY_PORT = int(os.environ.get('V90_VPN_PORT', '1233'))
-RELAY_PROTO = os.environ.get('V90_VPN_PROTO', 'udp')
-if not 1 <= RELAY_PORT <= 65535 or RELAY_PROTO not in ('udp', 'tcp'):
-    raise ValueError('Invalid VPN transport configuration')
+RELAY = '27.130.93.85'
 
 
 def run(*args):
     return subprocess.check_output(args, text=True).strip()
 
 
-def load_relays():
-    root = Path('/opt/v90/vpn')
-    listing = root / 'relays.json'
-    if not listing.exists():
-        return [(RELAY, RELAY_PORT, RELAY_PROTO, root / 'vpngate.ovpn')]
-    relays = []
-    for item in json.loads(listing.read_text()):
-        relay = str(ipaddress.IPv4Address(item['ip']))
-        port = int(item['port'])
-        proto = item['proto']
-        profile = (root / item['profile']).resolve()
-        if not 1 <= port <= 65535 or proto not in ('udp', 'tcp'):
-            raise ValueError('Invalid VPN transport configuration')
-        if profile.parent != root.resolve() or not profile.is_file():
-            raise ValueError('VPN profile must exist inside the VPN directory')
-        relays.append((relay, port, proto, profile))
-    if not relays:
-        raise ValueError('No VPN relays configured')
-    return relays
-
-
-def configure_network(relays):
+def main():
+    READY.unlink(missing_ok=True)
     routes = run('ip', '-4', 'route', 'show', 'default').split()
     gateway = routes[routes.index('via') + 1]
     device = routes[routes.index('dev') + 1]
-    # Configure all transport exceptions before rejecting non-VPN egress.
-    for relay, port, proto, _ in relays:
-        run('ip', 'route', 'replace', relay + '/32', 'via', gateway, 'dev', device)
-        run('iptables', '-A', 'OUTPUT', '-o', device, '-d', relay + '/32',
-            '-p', proto, '--dport', str(port), '-j', 'ACCEPT')
+    # Preserve only the VPN transport and Docker control network outside VPN.
+    run('ip', 'route', 'replace', RELAY + '/32', 'via', gateway, 'dev', device)
+    run('iptables', '-A', 'OUTPUT', '-o', device, '-d', RELAY + '/32',
+        '-p', 'udp', '--dport', '1233', '-j', 'ACCEPT')
     run('iptables', '-A', 'OUTPUT', '-o', device, '-d', '10.77.90.0/24', '-j', 'ACCEPT')
     run('iptables', '-A', 'OUTPUT', '-o', device, '-j', 'REJECT')
     run('iptables', '-A', 'FORWARD', '-s', '10.0.2.0/24', '-o', 'tun0', '-j', 'ACCEPT')
@@ -58,16 +30,12 @@ def configure_network(relays):
     run('iptables', '-A', 'FORWARD', '-j', 'REJECT')
     run('iptables', '-t', 'nat', '-A', 'POSTROUTING', '-s', '10.0.2.0/24',
         '-o', 'tun0', '-j', 'MASQUERADE')
+    # Avoid Docker's DNS forwarder using the home uplink for proxy requests.
     Path('/etc/resolv.conf').write_text('nameserver 1.1.1.1\n')
-    Path('/run/v90-uplink-configured').touch()
-
-
-def connect_once(profile):
-    READY.unlink(missing_ok=True)
     log = Path('/var/log/v90-multilink/vpn.log')
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open('w') as output:
-        child = subprocess.Popen(['openvpn', '--config', str(profile),
+        child = subprocess.Popen(['openvpn', '--config', '/opt/v90/vpn/vpngate.ovpn',
             '--dev', 'tun0', '--route-nopull', '--script-security', '0',
             '--verb', '3', '--auth-nocache', '--connect-retry-max', '1', '--tls-exit'],
             stdout=output, stderr=subprocess.STDOUT)
@@ -99,6 +67,7 @@ def connect_once(profile):
             print('VPN egress verified: ' + RELAY, flush=True)
             next_probe = time.monotonic() + 30
             failures = 0
+            reconnect_after = 0.0
             missing_since = None
             while child.poll() is None:
                 now = time.monotonic()
@@ -134,10 +103,13 @@ def connect_once(profile):
                     else:
                         READY.unlink(missing_ok=True)
                         failures += 1
-                        if failures >= 2:
+                        if failures >= 2 and now >= reconnect_after:
                             # Restart only the VPN transport; existing PPP
                             # processes stay alive while its interface recovers.
-                            raise RuntimeError('VPN egress stalled; trying the next relay')
+                            child.send_signal(signal.SIGUSR1)
+                            reconnect_after = now + 120
+                            failures = 0
+                            print('VPN egress stalled: reconnecting transport', flush=True)
                 time.sleep(1)
             raise RuntimeError('VPN stopped')
         finally:
@@ -149,26 +121,6 @@ def connect_once(profile):
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait()
-
-
-def maintain_relays(relays, connect=connect_once, pause=time.sleep):
-    global RELAY, RELAY_PORT, RELAY_PROTO
-    while True:
-        for RELAY, RELAY_PORT, RELAY_PROTO, profile in relays:
-            try:
-                connect(profile)
-            except (RuntimeError, subprocess.CalledProcessError, OSError) as error:
-                READY.unlink(missing_ok=True)
-                print(f'VPN relay {RELAY} unavailable: {error}', flush=True)
-                pause(3)
-        pause(15)
-
-
-def main():
-    READY.unlink(missing_ok=True)
-    relays = load_relays()
-    configure_network(relays)
-    maintain_relays(relays)
 
 
 if __name__ == '__main__':

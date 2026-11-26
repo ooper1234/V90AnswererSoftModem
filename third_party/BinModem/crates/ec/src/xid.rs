@@ -95,16 +95,6 @@ const N401_DEFAULT: u16 = crate::lapm::DEFAULT_N401 as u16;
 /// The window size when nobody proposes one (V.42 9.2.4).
 const K_DEFAULT: u8 = crate::lapm::DEFAULT_K;
 
-/// The information field this end offers to send, in octets.
-pub const OFFERED_N401_TRANSMIT: u16 = 512;
-
-/// The window this end offers to send with (V.42 9.2.4; "1 <= k <= 127",
-/// 8.1.3.3). At 15 frames a round trip of 0.85 s holds the download to 15 x
-/// N401 a round trip, 2.3 kB/s at 128 octets, under a V.90 line's rate. The
-/// far end answers between this and the default, so one that takes 15 says
-/// 15 and nothing changes for it. The receive window stays at the default.
-pub const OFFERED_K_TRANSMIT: u8 = 63;
-
 /// Bits of the HDLC optional functions mask that V.42 12.2.2 Note 1 names.
 ///
 /// Bit 1 is the low-order bit of the first octet and is transmitted first.
@@ -273,13 +263,9 @@ impl Xid {
     /// Everything this implementation supports, as an opening proposal.
     pub fn proposal(compression: Compression) -> Self {
         Self {
-            // Longer frames out where the far end takes them: with V.42's
-            // 15 x 128 octets outstanding, a round trip over a second holds
-            // the downstream to about 1.5 kB/s whatever the line carries.
-            // What is sent stays within what the far end takes (answer_limits).
-            n401_transmit: Some(OFFERED_N401_TRANSMIT),
+            n401_transmit: Some(crate::lapm::DEFAULT_N401 as u16),
             n401_receive: Some(crate::lapm::DEFAULT_N401 as u16),
-            window_transmit: Some(OFFERED_K_TRANSMIT),
+            window_transmit: Some(crate::lapm::DEFAULT_K),
             window_receive: Some(crate::lapm::DEFAULT_K),
             // Offered, because the alternative is worse than it looks. A
             // 16-bit check sequence lets about one damaged frame in 65536
@@ -599,55 +585,16 @@ impl Xid {
         self.v44?.resolve(other.v44?)
     }
 
-    /// The frame size and window each direction uses when this end answers
-    /// `command` (V.42 9.2.3, 9.2.4). Table 11a Note 2: "transmit" and
-    /// "receive" are each end's own, so the command's receive is the
-    /// direction this end transmits in. The responder's value lies "between
-    /// the value chosen by the initiator and the default value, inclusive";
-    /// within that, this end's own wish.
-    pub fn answer_limits(&self, command: &Self) -> Limits {
-        let n = |v: Option<u16>| v.unwrap_or(N401_DEFAULT);
-        let k = |v: Option<u8>| v.unwrap_or(K_DEFAULT);
-        Limits {
-            n401_transmit: between(n(self.n401_transmit), n(command.n401_receive), N401_DEFAULT),
-            n401_receive: between(n(self.n401_receive), n(command.n401_transmit), N401_DEFAULT),
-            window_transmit: between(k(self.window_transmit), k(command.window_receive), K_DEFAULT),
-            window_receive: between(k(self.window_receive), k(command.window_transmit), K_DEFAULT),
-        }
-    }
-
-    /// The frame size and window each direction uses when `response` answers
-    /// this end's command: the responder's values, read crosswise (its
-    /// receive is this end's transmit), and "the value used during the
-    /// operation of the error-corrected connection" (9.2.3, 9.2.4). Held
-    /// to no more than this end offered, or the default if that is more.
-    pub fn reply_limits(&self, response: &Self) -> Limits {
-        let n = |v: Option<u16>| v.unwrap_or(N401_DEFAULT);
-        let k = |v: Option<u8>| v.unwrap_or(K_DEFAULT);
-        Limits {
-            n401_transmit: n(response.n401_receive).min(n(self.n401_transmit).max(N401_DEFAULT)),
-            n401_receive: n(response.n401_transmit).min(n(self.n401_receive).max(N401_DEFAULT)),
-            window_transmit: k(response.window_receive).min(k(self.window_transmit).max(K_DEFAULT)),
-            window_receive: k(response.window_transmit).min(k(self.window_receive).max(K_DEFAULT)),
-        }
-    }
-
     /// Settle a proposal against a reply.
     ///
     /// V.42 9.2.3, 9.2.4 and V.42bis 5.1 all say the same thing for their own
     /// parameters: where the two ends differ, the lower value is used.
-    ///
-    /// The frame sizes and windows are this end's, settled as the answer to
-    /// `other` ([`Self::answer_limits`]): crosswise, not field by field, which
-    /// had a far end that sends 256 and takes 128 told this end would send
-    /// it 256 (2026-11-25).
     pub fn resolve(&self, other: &Self) -> Self {
-        let limits = self.answer_limits(other);
         Self {
-            n401_transmit: Some(limits.n401_transmit),
-            n401_receive: Some(limits.n401_receive),
-            window_transmit: Some(limits.window_transmit),
-            window_receive: Some(limits.window_receive),
+            n401_transmit: lower(self.n401_transmit, other.n401_transmit, N401_DEFAULT),
+            n401_receive: lower(self.n401_receive, other.n401_receive, N401_DEFAULT),
+            window_transmit: lower(self.window_transmit, other.window_transmit, K_DEFAULT),
+            window_receive: lower(self.window_receive, other.window_receive, K_DEFAULT),
             // A capability is used only if both ends offer it.
             fcs32: self.fcs32 && other.fcs32,
             srej_single: self.srej_single && other.srej_single,
@@ -716,21 +663,6 @@ impl Xid {
             n7: self.max_string.unwrap_or(v42bis::DEFAULT_N7),
         })
     }
-}
-
-/// `v` held between `a` and `b`, inclusive, whichever is the larger.
-fn between<T: Ord + Copy>(v: T, a: T, b: T) -> T {
-    v.clamp(a.min(b), a.max(b))
-}
-
-/// The frame size (N401, octets) and window (k) of each direction, from this
-/// end's side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Limits {
-    pub n401_transmit: u16,
-    pub n401_receive: u16,
-    pub window_transmit: u8,
-    pub window_receive: u8,
 }
 
 /// The lower of two proposals, where an absent one is not silence.
@@ -807,125 +739,6 @@ fn take_param(field: &[u8]) -> Result<Option<Parameter<'_>>, XidError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A U.S. Robotics Courier's XID command (its V.42bis N7 is 32), taken off
-    /// the line of an emulated Courier, answered with what was settled.
-    #[test]
-    fn an_answer_never_asks_for_more_than_the_command_offered() {
-        let courier: Vec<u8> = (0..)
-            .step_by(2)
-            .take_while(|&i| i < COURIER.len())
-            .map(|i| u8::from_str_radix(&COURIER[i..i + 2], 16).unwrap())
-            .collect();
-        let theirs = Xid::decode(&courier).unwrap();
-        assert_eq!(theirs.max_string, Some(32));
-        let mut ours = Xid::proposal(Compression::Both);
-        ours.codewords = Some(2048);
-        ours.max_string = Some(250);
-        let settled = ours.resolve(&theirs);
-        let answer = Xid::decode(&ours.answering(&settled).encode(Kind::Response)).unwrap();
-        assert_eq!(answer.max_string, Some(32));
-        // Nothing it did not offer: no 32-bit FCS, no multiple SREJ.
-        assert!(!theirs.fcs32 && !answer.fcs32);
-        assert!(!theirs.srej_multiple && !answer.srej_multiple);
-        assert!(answer.codewords <= theirs.codewords);
-        for (ours, theirs) in [
-            (answer.n401_transmit, theirs.n401_receive),
-            (answer.n401_receive, theirs.n401_transmit),
-            (answer.window_transmit.map(u16::from), theirs.window_receive.map(u16::from)),
-        ] {
-            assert!(ours <= theirs, "{ours:?} against {theirs:?}");
-        }
-    }
-
-    const COURIER: &str = "8280001303038e8900050207a0060207a007010f08010ff0000f000356343201010302020800030120ffff03485354400403000000f10106";
-
-    /// 2026-11-16: 15 frames of 128 octets outstanding against a 1.1 s
-    /// round trip held a 44 000 bit/s downstream to about 1.5 kB/s. What
-    /// this end sends is bounded by every limit the far end gave, read
-    /// either way round, and by what this end offered.
-    /// V.42 Table 11a, Note 2: each end's "transmit" is the other's
-    /// "receive". 9.2.3 and 9.2.4: the responder's value lies between the
-    /// initiator's and the default, inclusive, and is the value used.
-    #[test]
-    fn an_answer_pairs_each_direction_crosswise_between_the_offer_and_the_default() {
-        let ours = Xid { n401_transmit: Some(512), n401_receive: Some(128), window_transmit: Some(15), window_receive: Some(15), ..Default::default() };
-        // Sends 256 and takes 128; sends a window of 7, takes 15.
-        let command = Xid { n401_transmit: Some(256), n401_receive: Some(128), window_transmit: Some(7), window_receive: Some(15), ..Default::default() };
-        let l = ours.answer_limits(&command);
-        // Us to them: their receive (128) against the default: 128 only.
-        assert_eq!((l.n401_transmit, l.window_transmit), (128, 15));
-        // Them to us: between their transmit and the default; ours is 128/15.
-        assert_eq!((l.n401_receive, l.window_receive), (128, 15));
-        // A far end that takes big frames gets ours, up to what it takes.
-        let roomy = Xid { n401_receive: Some(1024), window_receive: Some(31), ..command };
-        let l = ours.answer_limits(&roomy);
-        assert_eq!((l.n401_transmit, l.window_transmit), (512, 15));
-        let wanting = Xid { n401_receive: Some(300), ..command };
-        assert_eq!(ours.answer_limits(&wanting).n401_transmit, 300);
-        // Below the default: between it and the default, ours being above.
-        let tight = Xid { n401_receive: Some(64), window_receive: Some(4), ..command };
-        let l = ours.answer_limits(&tight);
-        assert_eq!((l.n401_transmit, l.window_transmit), (128, 15));
-        // A far end that names nothing has V.42's defaults.
-        let l = ours.answer_limits(&Xid::default());
-        assert_eq!((l.n401_transmit, l.n401_receive, l.window_transmit, l.window_receive), (128, 128, 15, 15));
-    }
-
-    #[test]
-    fn the_answer_this_end_sends_says_the_crosswise_values() {
-        let mut ours = Xid::proposal(Compression::Both);
-        ours.n401_transmit = Some(512);
-        let command = Xid { n401_transmit: Some(256), n401_receive: Some(128), window_transmit: Some(7), window_receive: Some(15), ..Xid::proposal(Compression::Both) };
-        let settled = ours.resolve(&command);
-        let answer = Xid::decode(&ours.answering(&settled).encode(Kind::Response)).unwrap();
-        for (said, rule) in [
-            (answer.n401_transmit.map(u32::from), (128, 128)),
-            (answer.n401_receive.map(u32::from), (128, 256)),
-            (answer.window_transmit.map(u32::from), (15, 15)),
-            (answer.window_receive.map(u32::from), (7, 15)),
-        ] {
-            let v = said.unwrap();
-            assert!(rule.0 <= v && v <= rule.1, "{v} outside {rule:?}");
-        }
-    }
-
-    #[test]
-    fn this_end_offers_a_wide_window_to_send_with_and_the_default_to_receive() {
-        let ours = Xid::proposal(Compression::Both);
-        assert_eq!((ours.window_transmit, ours.window_receive), (Some(OFFERED_K_TRANSMIT), Some(15)));
-        assert!((1..=127).contains(&OFFERED_K_TRANSMIT), "V.42 8.1.3.3: 1 <= k <= 127");
-        // A far end that takes 15 (or names nothing) gets 15, either way round.
-        let fifteen = Xid { window_receive: Some(15), ..Default::default() };
-        assert_eq!(ours.answer_limits(&fifteen).window_transmit, 15);
-        assert_eq!(ours.answer_limits(&Xid::default()).window_transmit, 15);
-        assert_eq!(ours.reply_limits(&fifteen).window_transmit, 15);
-        // One that takes more gets as much as it takes, up to the offer.
-        let wide = Xid { window_receive: Some(127), ..Default::default() };
-        assert_eq!(ours.answer_limits(&wide).window_transmit, OFFERED_K_TRANSMIT);
-        let answered = Xid { window_receive: Some(40), ..Default::default() };
-        assert_eq!(ours.reply_limits(&answered).window_transmit, 40);
-    }
-
-    /// As the initiator: the responder's value for each direction is used,
-    /// read crosswise, and never above this end's offer (or the default). A
-    /// value under what 9.2.3 allows is honoured all the same: these are
-    /// maximums, and sending less than one is always safe.
-    #[test]
-    fn a_reply_says_what_this_end_sends_with() {
-        let ours = Xid { n401_transmit: Some(512), n401_receive: Some(128), window_transmit: Some(15), window_receive: Some(15), ..Default::default() };
-        // The responder's receive is our direction to it.
-        let reply = Xid { n401_transmit: Some(128), n401_receive: Some(256), window_transmit: Some(15), window_receive: Some(9), ..Default::default() };
-        let l = ours.reply_limits(&reply);
-        assert_eq!((l.n401_transmit, l.window_transmit), (256, 9));
-        assert_eq!((l.n401_receive, l.window_receive), (128, 15));
-        // A reply out of range is held to it: over our offer, or past the default.
-        let greedy = Xid { n401_receive: Some(4096), window_receive: Some(40), ..reply };
-        let l = ours.reply_limits(&greedy);
-        assert_eq!((l.n401_transmit, l.window_transmit), (512, 15));
-        let l = ours.reply_limits(&Xid::default());
-        assert_eq!((l.n401_transmit, l.window_transmit), (128, 15));
-    }
 
     #[test]
     fn a_proposal_round_trips() {
@@ -1084,14 +897,8 @@ mod tests {
             ..Default::default()
         };
         let agreed = mine.resolve(&theirs);
-        // Table 11a Note 2: their transmit is our receive. They name no
-        // receive values, so ours to them sit at the default: 128 and 15.
         assert_eq!(agreed.n401_transmit, Some(128));
-        assert_eq!(agreed.window_transmit, Some(15));
-        // Theirs to us: between their 128 / 7 and the default; we have no
-        // wish past the default.
-        assert_eq!(agreed.n401_receive, Some(128));
-        assert!((7..=15).contains(&agreed.window_receive.unwrap()));
+        assert_eq!(agreed.window_transmit, Some(7));
         assert_eq!(agreed.codewords, Some(512));
         assert_eq!(agreed.max_string, Some(6));
     }

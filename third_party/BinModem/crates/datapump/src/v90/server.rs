@@ -49,11 +49,7 @@ pub fn ours() -> Info0d {
         max_power: 23,
         power_at_codec: true,
         a_law: false,
-        // Not offered: 3429-baud upstream (j=8/p=15) trained but would not
-        // hold on VoIP paths, while 3200 baud does. The deployed daemon had
-        // this byte patched to false since 2026-11-01; this is the same change
-        // made in source.
-        upstream_3429: false,
+        upstream_3429: true,
     }
 }
 

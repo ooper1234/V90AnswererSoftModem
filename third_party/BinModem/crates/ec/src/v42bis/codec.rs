@@ -486,10 +486,6 @@ impl Decoder {
             return Err(Error::UnknownCodeword(code));
         }
         let string = self.inner.dict.string(code);
-        // Longer than N7 only when the walk met a loop: diverged dictionaries.
-        if string.len() > usize::from(self.inner.dict.params().n7) {
-            return Err(Error::UnknownCodeword(code));
-        }
         // 9.2 b): the escape character moves on "in both transparent and
         // compressed modes", and 2.13 says the same -- "adjusted on each
         // appearance of the escape character in the data stream from the DTE,

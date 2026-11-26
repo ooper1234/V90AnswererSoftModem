@@ -29,15 +29,13 @@ size_t sm_bitq_bytes(const sm_bitq_t *q)
 int sm_bitq_push_byte(sm_bitq_t *q, uint8_t byte)
 {
     int i;
-    int stops = q->stop_bits ? q->stop_bits : 1;
 
-    if (q->head - q->tail + 9 + stops > SM_BITQ_SIZE)
+    if (q->head - q->tail + 10 > SM_BITQ_SIZE)
         return -1;
     sm_bitq_push(q, 0);                       /* start bit */
     for (i = 0; i < 8; i++)
         sm_bitq_push(q, (byte >> i) & 1);     /* data LSB first */
-    for (i = 0; i < stops; i++)
-        sm_bitq_push(q, 1);                   /* stop bit(s) */
+    sm_bitq_push(q, 1);                       /* stop bit */
     return 0;
 }
 

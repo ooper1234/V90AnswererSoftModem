@@ -31,7 +31,6 @@ pub mod encoder;
 pub mod modulus;
 pub mod network;
 pub mod pcm;
-mod pcmup;
 pub mod sequences;
 pub mod server;
 pub mod shaping;

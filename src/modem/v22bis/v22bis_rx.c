@@ -296,10 +296,6 @@ static void process_half_baud(v22bis_state_t *s, const sm_complexf_t *sample)
                 s->rx.pattern_repeats = 0;
                 s->rx.training_count = 0;
                 s->rx.training = V22BIS_RX_TRAINING_SCRAMBLED_ONES_AT_1200;
-                /* The retrain's S1 and scrambled ones are 4-phase at 1200 b/s,
-                   as in the first training; slicing them 16-way with a reset
-                   equalizer trains it on wrong decisions. */
-                s->rx.sixteen_way_decisions = false;
                 s->tx.training_count = 0;
                 s->tx.training = V22BIS_TX_TRAINING_U0011;
                 equalizer_reset(s);
@@ -469,7 +465,6 @@ static void process_half_baud(v22bis_state_t *s, const sm_complexf_t *sample)
                     s->rx.sixteen_way_decisions = true;
                     s->rx.training = V22BIS_RX_TRAINING_WAIT_FOR_SCRAMBLED_ONES_AT_2400;
                     s->rx.pattern_repeats = 0;
-                    s->rx.training_count = 0;
                     s->rx.carrier_track_i = 8000.0f;
                 }
             }
@@ -480,7 +475,6 @@ static void process_half_baud(v22bis_state_t *s, const sm_complexf_t *sample)
                     s->rx.sixteen_way_decisions = true;
                     s->rx.training = V22BIS_RX_TRAINING_WAIT_FOR_SCRAMBLED_ONES_AT_2400;
                     s->rx.pattern_repeats = 0;
-                    s->rx.training_count = 0;
                 }
             }
         }
@@ -502,18 +496,7 @@ static void process_half_baud(v22bis_state_t *s, const sm_complexf_t *sample)
         track_carrier(s, &z, target);
         tune_equalizer(s, &z, target);
         bitstream = decode_baudx(s, nearest);
-        /* Need 32 sustained 1s to enter 2400 data mode. The far end sends
-           them for only 200 ms and then data, which never repeats them, so
-           a run missed here would leave the receiver waiting for good: a
-           retrain on a call from a USR Sportster stopped like that. Past
-           the scrambled ones' end, take the data as it comes. */
-        if (++s->rx.training_count >= ms_to_symbols(700))
-        {
-            sm_log_message(&s->log, SM_LOG_FLOW, "+++ Rx normal operation (2400, no run of ones seen)");
-            s->rx.training = V22BIS_RX_TRAINING_NORMAL_OPERATION;
-            s->rx.pattern_repeats = 0;
-            break;
-        }
+        /* Need 32 sustained 1s to enter 2400 data mode. */
         if (bitstream == 0xF)
         {
             if (++s->rx.pattern_repeats >= 9)

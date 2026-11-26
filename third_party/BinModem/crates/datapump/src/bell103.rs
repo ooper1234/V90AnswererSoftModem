@@ -21,7 +21,7 @@
 
 use dsp::FskDetector;
 
-use crate::framing::{AsyncBits, AsyncFramer, BitClock};
+use crate::framing::{AsyncBits, AsyncFramer};
 
 /// Which end of the call this modem is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,21 +55,11 @@ pub const BAUD: f64 = 300.0;
 pub struct Bell103Rx {
     detector: FskDetector,
     framer: AsyncFramer,
-    /// The same level taken at a recovered clock, for V.42's synchronous
-    /// frames, which have no start bits for the framer to find.
-    clock: BitClock,
-    raw: Option<bool>,
     last_level: f64,
     symbol: Option<f64>,
 }
 
 impl Bell103Rx {
-    #[cfg(test)]
-    pub(crate) fn capture_bandwidth(space:f64,mark:f64,baud:f64,fs:f64,detector_baud:f64)->Self {
-        let mut rx=Self::with_baud(space,mark,baud,fs);
-        rx.detector=FskDetector::new(space,mark,detector_baud,fs);
-        rx
-    }
     /// Build a receiver listening to the band the far end of `role` transmits in.
     pub fn new(role: Role, fs: f64) -> Self {
         let (space, mark) = role.receive_tones();
@@ -79,16 +69,9 @@ impl Bell103Rx {
     /// Build a receiver for an explicit tone pair, for V.21 or for tapping a
     /// specific direction out of a 2-wire capture.
     pub fn with_tones(space: f64, mark: f64, fs: f64) -> Self {
-        Self::with_baud(space, mark, BAUD, fs)
-    }
-
-    pub fn with_baud(space: f64, mark: f64, baud: f64, fs: f64) -> Self {
-        assert!(baud.is_finite() && baud > 0.0 && fs.is_finite() && fs > 2.0 * space.max(mark));
         Self {
-            detector: FskDetector::new(space, mark, baud, fs),
-            framer: AsyncFramer::new(baud, fs, 8),
-            clock: BitClock::new(baud, fs),
-            raw: None,
+            detector: FskDetector::new(space, mark, BAUD, fs),
+            framer: AsyncFramer::new(BAUD, fs, 8),
             last_level: 0.0,
             symbol: None,
         }
@@ -102,14 +85,7 @@ impl Bell103Rx {
         let carrier = self.detector.carrier();
         let out = self.framer.feed(level, carrier);
         self.symbol = self.framer.take_sampled();
-        self.raw = if carrier { self.clock.feed(level) } else { self.clock.reset(); None };
         out
-    }
-
-    /// The line bit taken at the recovered clock on the last `feed`, if one
-    /// fell due: the synchronous view of the same samples.
-    pub fn take_raw_bit(&mut self) -> Option<bool> {
-        self.raw.take()
     }
 
     /// Discriminator level of the bit sampled on the last `feed`, if any.
@@ -119,9 +95,6 @@ impl Bell103Rx {
     pub fn take_symbol(&mut self) -> Option<f64> {
         self.symbol.take()
     }
-
-    /// Reset a partial character after carrier qualification.
-    pub fn reset_framing(&mut self) { self.framer.reset(); }
 
     pub fn carrier(&self) -> bool {
         self.detector.carrier()
@@ -182,18 +155,13 @@ impl Bell103Tx {
     }
 
     pub fn with_tones(space: f64, mark: f64, fs: f64) -> Self {
-        Self::with_baud(space, mark, BAUD, fs)
-    }
-
-    pub fn with_baud(space: f64, mark: f64, baud: f64, fs: f64) -> Self {
-        assert!(baud.is_finite() && baud > 0.0 && fs.is_finite() && fs > 2.0 * space.max(mark));
         Self {
             space,
             mark,
             fs,
             phase: 0.0,
-            countdown: fs / baud,
-            sps: fs / baud,
+            countdown: fs / BAUD,
+            sps: fs / BAUD,
             pending: std::collections::VecDeque::new(),
             current: true,
             transmitting: false,

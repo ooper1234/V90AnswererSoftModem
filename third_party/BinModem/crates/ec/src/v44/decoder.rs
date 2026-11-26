@@ -107,13 +107,6 @@ impl Decoder {
         self.mode
     }
 
-    /// How many characters the history holds, for tests that check a far
-    /// end's encoder never makes it grow past N8R (7.11.4).
-    #[cfg(test)]
-    pub(crate) fn history_len(&self) -> usize {
-        self.history.len()
-    }
-
 
     /// C1, "codeword value of next available entry of ... string collection".
     fn c1(&self) -> u16 {
@@ -156,12 +149,9 @@ impl Decoder {
             self.awaiting_command = false;
             match byte {
                 command::ECM => {
-                    // 6.5.2: the dictionary starts again. The ESCAPE does
-                    // not: 7.14 sets it to zero only at initialisation of
-                    // the data compression function (7.5), so the next
-                    // transparent spell goes on from where this one left it.
                     self.reinitialize();
                     self.mode = Mode::Compressed;
+                    self.escape = 0;
                 }
                 command::EID => {
                     // 7.14: the ESCAPE was data. It goes out as itself, and

@@ -16,17 +16,14 @@ extern "C" fn put(p:*mut c_void,b:c_int) {
 }
 fn run(max_rate:c_int) { run_line(max_rate,32,1,1.0,0.0) }
 fn run_line(max_rate:c_int, delay:usize, echo_delay:usize, far:f64, echo:f64) {
-    run_startup(max_rate,delay,echo_delay,far,echo,false);
-}
-fn run_startup(max_rate:c_int, delay:usize, echo_delay:usize, far:f64, echo:f64, v8:bool) {
     let sent_a:Vec<u8>=(0..1024).map(|i| if i<512 {b'A'} else {(i*73+9) as u8}).collect();
     let sent_b:Vec<u8>=(0..1024).map(|i| if i<512 {b'B'} else {(i*29+7) as u8}).collect();
     let mut a=Dte::default();let mut b=Dte::default();
     for &byte in &sent_a {a.tx.extend(AsyncBits::new(8).encode(byte));}
     for &byte in &sent_b {b.tx.extend(AsyncBits::new(8).encode(byte));}
     let ap=&mut a as *mut Dte as *mut c_void;let bp=&mut b as *mut Dte as *mut c_void;
-    let end_a=if v8 {bm_create(1,0,Some(get),ap,Some(put),ap)} else {bm_create_v32(1,max_rate,Some(get),ap,Some(put),ap)};
-    let end_b=if v8 {bm_create(0,0,Some(get),bp,Some(put),bp)} else {bm_create_v32(0,max_rate,Some(get),bp,Some(put),bp)};
+    let end_a=bm_create_v32(1,max_rate,Some(get),ap,Some(put),ap);
+    let end_b=bm_create_v32(0,max_rate,Some(get),bp,Some(put),bp);
     let mut ab=VecDeque::from(vec![0;delay]);let mut ba=ab.clone();
     let mut aa=VecDeque::from(vec![0;echo_delay]);let mut bb=aa.clone();
     for tick in 0..(80*8000) {
@@ -55,8 +52,5 @@ fn run_startup(max_rate:c_int, delay:usize, echo_delay:usize, far:f64, echo:f64,
 }
 #[test]fn v32_with_lapm_and_compressed_bidirectional_bytes(){run(9600);}
 #[test]fn v32bis_with_lapm_and_compressed_bidirectional_bytes(){run(14400);}
-#[test]fn v8_v32bis_handover_with_lapm_and_compressed_bidirectional_bytes(){run_startup(14400,32,1,1.0,0.0,true);}
 
 #[test]fn v32bis_resampled_delayed_echo_line(){run_line(14400,720,1312,0.25,0.22);}
-
-#[test]fn v32bis_resampled_seven_hundred_ms_network(){run_line(14400,2800,5800,0.25,0.22);}

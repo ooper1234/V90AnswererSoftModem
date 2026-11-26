@@ -102,16 +102,6 @@ target_link_libraries(replay_pcm softmodem ${MATH_LIB})
 
 add_executable(bbs_session_test tests/bbs_session.c)
 target_link_libraries(bbs_session_test softmodem ${MATH_LIB})
-add_executable(server_closed_test tests/server_closed.c)
-target_include_directories(server_closed_test PRIVATE ${CMAKE_SOURCE_DIR}/src/call)
-target_link_libraries(server_closed_test softmodem ${MATH_LIB})
-
-add_executable(sm_async_stop_bits tests/sm_async_stop_bits.c)
-target_link_libraries(sm_async_stop_bits softmodem ${MATH_LIB})
-
-add_executable(legacy_detect_test tests/legacy_detect.c)
-target_include_directories(legacy_detect_test PRIVATE src)
-target_link_libraries(legacy_detect_test ${MATH_LIB})
 
 # PTY byte transport test
 add_executable(v22bis_pty tests/v22bis_pty.c)

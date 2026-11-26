@@ -1,4 +1,3 @@
-#include <stdlib.h>
 #include "v22bis.h"
 #include "../../dsp/carrier/sm_dds.h"
 #include "../../dsp/detectors/sm_power_meter.h"
@@ -302,20 +301,7 @@ void v22bis_restart(v22bis_state_t *s)
                                           / (float) SM_SAMPLE_RATE * 4294967296.0f);
     s->tx.carrier_phase = 0;
     s->tx.guard_tone_gain = 0.0f;
-    /* -11 dBm0, where a real modem on a phone line sits. -14 was quiet
-       enough that a USR Sportster's receiver lost us and asked for retrains
-       over a long VoIP route. V22_TX_DBM0 overrides it (-20 to -6). */
-    {
-        float dbm0 = -11.0f;
-        const char *e = getenv("V22_TX_DBM0");
-        if (e && *e)
-        {
-            float v = strtof(e, NULL);
-            if (v >= -20.0f && v <= -6.0f)
-                dbm0 = v;
-        }
-        v22bis_tx_power(s, dbm0);
-    }
+    v22bis_tx_power(s, -14.0f);
 
     s->negotiated_bit_rate = 1200;
     v22bis_rx_restart(s);

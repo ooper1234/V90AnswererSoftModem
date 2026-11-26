@@ -167,11 +167,6 @@ impl Dictionary {
         let mut out = Vec::new();
         let mut cursor = Some(code);
         while let Some(c) = cursor {
-            // No string is longer than N7; a walk that goes further has met
-            // a loop, and stopping is all there is to do with one.
-            if out.len() > usize::from(self.params.n7) {
-                break;
-            }
             let Some(node) = self.nodes.get(c as usize) else { break };
             if !node.in_use {
                 break;
@@ -186,7 +181,7 @@ impl Dictionary {
     /// First character of the string a codeword names, without building it.
     pub fn first_char(&self, code: u16) -> Option<u8> {
         let mut cursor = code;
-        for _ in 0..=usize::from(self.params.n7) {
+        loop {
             let node = self.nodes.get(cursor as usize)?;
             if !node.in_use {
                 return None;
@@ -196,7 +191,6 @@ impl Dictionary {
                 None => return Some(node.ch),
             }
         }
-        None
     }
 
     /// Add `parent + ch` as a new entry (V.42bis 6.4).
@@ -204,12 +198,6 @@ impl Dictionary {
     /// Returns the new codeword, or `None` when the string is already present
     /// or would exceed N7.
     pub fn add(&mut self, parent: u16, ch: u8) -> Option<u16> {
-        // An entry recovery has just freed names no string any more, and the
-        // slot it left is the one this entry would go into: extending it would
-        // make the entry its own parent (see `a_freed_entry_is_never_extended`).
-        if !self.in_use(parent) {
-            return None;
-        }
         if self.depth(parent) as u16 + 1 > self.params.n7 as u16 {
             return None;
         }
@@ -353,35 +341,6 @@ mod tests {
                 let s = d.string(code);
                 assert!(!s.is_empty(), "codeword {code} names an empty string");
                 assert_eq!(s.len() as u8, d.depth(code));
-            }
-        }
-    }
-
-    /// Recovery (6.5) frees the next slot as soon as an entry is made, and
-    /// that slot can be the very string the next entry is meant to extend --
-    /// which happens when the two ends' dictionaries differ, as they do
-    /// while a far end's parameters are being guessed. Extending a freed entry
-    /// made the new entry its own parent, and every walk up the string from
-    /// there went round for ever: a decoder that never returned.
-    #[test]
-    fn a_freed_entry_is_never_extended() {
-        let params = Params { n2: 512, n7: 250 };
-        let mut d = Dictionary::new(params);
-        // Fill until recovery has a leaf to free.
-        let mut freed = None;
-        'fill: for a in 0..=255u8 {
-            for b in 0..=255u8 {
-                if d.add(Dictionary::root_code(a), b).is_some() && d.c1 >= N5 && !d.in_use(d.c1) && d.nodes[d.c1 as usize].parent.is_none() && a > 2 {
-                    freed = Some(d.c1);
-                    break 'fill;
-                }
-            }
-        }
-        let freed = freed.expect("recovery never freed a slot");
-        assert_eq!(d.add(freed, b'x'), None, "a freed entry was extended");
-        for code in N5..params.n2 {
-            if d.in_use(code) {
-                assert!(d.string(code).len() <= usize::from(params.n7), "codeword {code} loops");
             }
         }
     }

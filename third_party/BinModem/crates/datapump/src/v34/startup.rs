@@ -124,10 +124,6 @@ impl Modem {
         &self.phase2
     }
 
-    pub fn prime_initial_receiver(&mut self, history: impl IntoIterator<Item = f64>) {
-        self.phase2.prime_initial_receiver(history);
-    }
-
     /// Phases 3 and 4, once phase 2 is over.
     pub fn training(&self) -> Option<&training::Modem> {
         self.training.as_ref()
@@ -230,22 +226,12 @@ impl Modem {
         self.training.as_ref().is_some_and(training::Modem::far_end_silent)
     }
 
-    /// The far end silent and its last J gone by: rows of our echo alone.
-    pub fn far_end_quiet(&self) -> bool {
-        self.training.as_ref().is_some_and(training::Modem::far_end_quiet)
-    }
-
     /// Ask for V.34 in phase 2's INFO1a from now on, even of a V.90 server.
     pub fn decline_pcm(&mut self) {
         self.phase2.decline_pcm();
     }
 
     /// Start phase 2 again as a retrain, from wherever this start-up is.
-    /// V.92: offer PCM upstream no more in this call.
-    pub fn decline_pcm_upstream(&mut self) {
-        self.phase2.decline_pcm_upstream();
-    }
-
     pub fn restart_phase2(&mut self) {
         self.phase2 = self.phase2.again();
         self.training = None;
