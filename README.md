@@ -6,6 +6,8 @@ modem bank. It supports V.90 and V.92 56k, the older standards down to 300
 bit/s, V.42 error correction with V.42bis/V.44 compression, and gives each
 caller a PPP internet connection.
 
+Test Number: +1-616-988-2103
+
 It uses the vendored [BinModem](https://github.com/CasualArclamp/BinModem)
 engine. It is experimental: it works on live calls, but long-call
 reliability depends heavily on the phone line.
