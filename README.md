@@ -74,7 +74,8 @@ cd V90AnswererSoftModem
 
 It asks for everything it needs: this machine's address, whether modems
 call through an ATA or a SIP provider (or both), the ATA's account or the
-provider's details, ports, and which optional modes to turn on. Then it
+provider's details, ports, and which optional modes to turn on (x2,
+V.92 PCM upstream, Quick Connect and V.8bis). Then it
 writes the configuration, builds and starts three containers (Asterisk with
 the patched AudioSocket, the audio pacer and the modem answerer), checks
 them, and prints the settings to type into your ATA.
@@ -91,7 +92,8 @@ Afterwards:
 | `./setup.sh uninstall` | Remove the containers and images (settings stay) |
 
 Settings and passwords are kept in `deploy/generated/`, readable only by
-you. The first build takes several minutes.
+you. The first build takes several minutes. See
+[Configuration](#configuration) to change things afterwards.
 
 For your own Asterisk instead, or no Docker, install by hand:
 
@@ -136,17 +138,80 @@ namespace lets AudioSocket reach `127.0.0.1:9093`.
 
 ### Optional modes
 
-Environment variables, off unless set (with Docker, pass them with `-e`):
+Turn on x2, V.92 PCM upstream, Quick Connect or V.8bis with environment
+variables; see [Modem options](#modem-options).
 
-| Variable | Effect |
+## Configuration
+
+### With setup.sh
+
+The easiest way to change anything is to run `./setup.sh` again: every
+question starts with your previous answer, so press Enter to keep it and
+type only what changes. It rewrites the configuration and restarts the
+containers.
+
+It keeps these files in `deploy/generated/`:
+
+| File | Holds |
 |---|---|
-| `V90_X2=1` | Answer U.S. Robotics x2 callers (mu-law lines only) |
-| `V92_PCM_UPSTREAM=1` | Offer V.92 PCM upstream. PCM is never offered without it |
-| `V92_PCM_ECHO=1` | Echo canceller for PCM upstream (use with the above) |
-| `B103_V42=1` | V.42 error control on Bell 103 |
-| `V22_V42=0` | Turn V.42 off on V.22bis |
-| `V8BIS_ENABLE=1` | Answer with V.8bis signalling |
-| `V90_COMPRESSION=0` | Keep V.42 but turn compression off |
+| `settings.env` | Your answers, including passwords |
+| `answerer.env` | The modem's options (the variables below) |
+| `pjsip.conf` | Asterisk's SIP accounts: the ATA and the SIP provider |
+| `extensions.conf` | Which numbers reach the modem |
+| `rtp.conf` | The RTP audio port range |
+| `stack.env` | The internal AudioSocket ports |
+
+To change a modem option that setup.sh does not ask about, edit
+`deploy/generated/answerer.env` and run `./setup.sh restart`. Running
+`./setup.sh` again rewrites that file, so set those options again after it.
+
+### Modem options
+
+The answerer reads these environment variables (`answerer.env` with
+setup.sh, `-e` with Docker, or the shell when run natively). `1` turns an
+option on and `0` off.
+
+| Variable | setup.sh | Effect |
+|---|---|---|
+| `V90_X2` | asked | Answer U.S. Robotics x2 callers (mu-law lines only) |
+| `V92_PCM_UPSTREAM` | asked | Offer V.92 PCM upstream |
+| `V92_PCM_ECHO` | follows PCM upstream | Echo canceller for PCM upstream |
+| `V92_QUICK_CONNECT`, `V92_QC_ANSWER` | asked (Quick Connect) | Answer V.92 Quick Connect |
+| `V8BIS_ENABLE` | asked (V.8bis) | Answer with V.8bis signalling |
+| `V92_QC_V8BIS` | follows V.8bis | `0`: Quick Connect only after the answer tone, not inside V.8bis |
+| `V92_QC_DELAY_COMPENSATION` | `1` | Accept late Quick Connect replies on long-delay lines |
+| `V90_COMPRESSION` | on | `0` keeps V.42 but turns compression off |
+| `V90_ERROR_CONTROL` | on | `0` turns V.42 off (testing only) |
+| `B103_V42` | off | V.42 on Bell 103 |
+| `V22_V42` | on | `0` turns V.42 off on V.22bis |
+| `ECHO_TAPS` | `256` | Length of the echo canceller |
+
+### Command-line options
+
+The answerer program (`sm_daemon`) also takes options; setup.sh sets them
+in `deploy/compose.yaml`. The main ones:
+
+| Option | Does |
+|---|---|
+| `--listen ADDR`, `--port N` | Where it waits for Asterisk's AudioSocket |
+| `--v90` | V.90/V.92 with the BinModem engine (implies `--binmodem`) |
+| `--v34` | Offer V.34 (and the legacy modes) |
+| `--pppd PATH` | The PPP program: `scripts/ppp-slirp.py` for SLiRP, or pppd |
+| `--local-ip`, `--peer-ip`, `--dns1`, `--dns2` | PPP addresses for each caller |
+| `--auth` | Require a PAP login (needs pap-secrets) |
+| `--log-dir DIR` | Folder for per-call logs |
+| `--echo --no-ppp` | Byte-for-byte echo instead of PPP, for testing |
+| `--v23`, `--v32bis`, ... | Answer only that one mode |
+| `--debug` | More detail in the logs |
+
+`sm_daemon --help` lists them all.
+
+### Audio pacer
+
+With setup.sh, calls pass through `server-files/audio_pace.py`, which
+evens out late and lost packets. Its settings are in `deploy/compose.yaml`
+(`PACE_TX_LEAD` is how many 20 ms frames it keeps ready; `5` suits most
+lines). After editing that file, run `./setup.sh restart`.
 
 ## Asterisk setup
 

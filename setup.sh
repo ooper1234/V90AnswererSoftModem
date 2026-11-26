@@ -5,7 +5,7 @@
 #   ./setup.sh             ask everything, write the configs, build and start
 #   ./setup.sh status      what is running, SIP registrations, recent calls
 #   ./setup.sh logs        follow the logs (Ctrl-C to stop)
-#   ./setup.sh restart     restart the stack
+#   ./setup.sh restart     restart the stack (and apply edited config files)
 #   ./setup.sh stop        stop the stack
 #   ./setup.sh uninstall   stop and remove the containers and images
 #
@@ -143,6 +143,9 @@ questions() {
     ask_yes X2 "U.S. Robotics x2 (56k; needs a u-law line)" "${X2:-y}"
     ask_yes PCM_UP "V.92 PCM upstream (faster uploads; experimental)" "${PCM_UP:-y}"
     ask_yes QC "V.92 Quick Connect (faster reconnects)" "${QC:-y}"
+    info "V.8bis is another way for modems to start a call. Callers connect without it;"
+    info "turning it on is experimental and has not been tested on live calls."
+    ask_yes V8BIS "V.8bis answering (experimental)" "${V8BIS:-n}"
 }
 
 summary() {
@@ -152,7 +155,7 @@ summary() {
     [ "$USE_ATA" = y ] && info "ATA account         $ATA_USER, modem dials $MODEM_NUMBER"
     [ "$USE_TRUNK" = y ] && info "SIP provider        $TRUNK_USER @ $TRUNK_HOST (register: $TRUNK_REGISTER)"
     info "Ports               SIP $SIP_PORT/udp, RTP $RTP_START-$RTP_END/udp"
-    info "Modes               x2 $X2, V.92 PCM upstream $PCM_UP, Quick Connect $QC"
+    info "Modes               x2 $X2, V.92 PCM upstream $PCM_UP, Quick Connect $QC, V.8bis $V8BIS"
 }
 
 # --- writing the configs ----------------------------------------------------
@@ -165,7 +168,7 @@ write_configs() {
     # Saved answers, for the next run.
     {
         for v in LAN_IP LAN_NET PUBLIC_IP USE_ATA ATA_USER ATA_PASS MODEM_NUMBER USE_TRUNK TRUNK_HOST \
-                 TRUNK_USER TRUNK_AUTH_USER TRUNK_PASS TRUNK_REGISTER SIP_PORT RTP_START PACER_PORT X2 PCM_UP QC; do
+                 TRUNK_USER TRUNK_AUTH_USER TRUNK_PASS TRUNK_REGISTER SIP_PORT RTP_START PACER_PORT X2 PCM_UP QC V8BIS; do
             printf '%s=%q\n' "$v" "${!v-}"
         done
     } > "$SETTINGS"
@@ -177,14 +180,15 @@ write_configs() {
 # The live server's settings for the V.92 build.
 ECHO_TAPS=256
 V90_ECHO_TRACKING=0
-V8BIS_ENABLE=0
+V8BIS_ENABLE=$(yes1 "$V8BIS")
 V90_PRIME_HANDOVER=1
 V90_TRN1D=2.0
 BM_EC_HEALTH=1
 V92_RENEG_TRN2D=0
 V92_QUICK_CONNECT=$(yes1 "$QC")
 V92_QC_ANSWER=$(yes1 "$QC")
-V92_QC_V8BIS=0
+# With V.8bis off, Quick Connect is answered only after the answer tone.
+V92_QC_V8BIS=$(yes1 "$V8BIS")
 V92_QC_DELAY_COMPENSATION=1
 V90_X2=$(yes1 "$X2")
 V92_PCM_UPSTREAM=$(yes1 "$PCM_UP")
@@ -449,7 +453,7 @@ main() {
         setup|"") cmd_setup ;;
         status) shift; cmd_status "$@" ;;
         logs) find_docker; need_setup; compose logs -f --tail 50 ;;
-        restart) find_docker; need_setup; compose restart ;;
+        restart) find_docker; need_setup; compose up -d --force-recreate ;;
         stop) find_docker; need_setup; compose stop ;;
         uninstall)
             find_docker; need_setup
