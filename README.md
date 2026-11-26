@@ -57,7 +57,9 @@ does. HST 16 800 and 4 800 are not implemented.
 ## Quick setup (all in one)
 
 On a Linux machine with Docker (the script offers to install it on Debian
-or Ubuntu):
+or Ubuntu). It is Linux only for now: on Windows, under WSL2 or Docker
+Desktop, the containers are not on your local network, so an ATA cannot
+reach them without extra networking setup.
 
 ```sh
 git clone https://github.com/ooper1234/V90AnswererSoftModem.git
