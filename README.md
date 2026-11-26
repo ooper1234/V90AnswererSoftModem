@@ -54,6 +54,40 @@ does. HST 16 800 and 4 800 are not implemented.
   Linksys PAP2) with a modem on its phone port, or a SIP trunk that does
   not re-encode calls. 56k modes need an exact u-law path.
 
+## Quick setup (all in one)
+
+On a Linux machine with Docker (the script offers to install it on Debian
+or Ubuntu):
+
+```sh
+git clone https://github.com/ooper1234/V90AnswererSoftModem.git
+cd V90AnswererSoftModem
+./setup.sh
+```
+
+It asks for everything it needs: this machine's address, whether modems
+call through an ATA or a SIP provider (or both), the ATA's account or the
+provider's details, ports, and which optional modes to turn on. Then it
+writes the configuration, builds and starts three containers (Asterisk with
+the patched AudioSocket, the audio pacer and the modem answerer), checks
+them, and prints the settings to type into your ATA.
+
+Afterwards:
+
+| Command | Does |
+|---|---|
+| `./setup.sh` | Change settings (your previous answers are the defaults) |
+| `./setup.sh status` | What is running, registrations, recent calls |
+| `./setup.sh status --show-password` | The same, plus the ATA's password |
+| `./setup.sh logs` | Follow the logs |
+| `./setup.sh restart` / `stop` | Restart or stop it |
+| `./setup.sh uninstall` | Remove the containers and images (settings stay) |
+
+Settings and passwords are kept in `deploy/generated/`, readable only by
+you. The first build takes several minutes.
+
+For your own Asterisk instead, or no Docker, install by hand:
+
 ## Install
 
 ### Native build

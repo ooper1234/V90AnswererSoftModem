@@ -1,0 +1,62 @@
+# The modem server in one stack: Asterisk (with the patched AudioSocket), the
+# audio pacer that gives calls a steady 20 ms clock, and the modem answerer.
+# ./setup.sh writes generated/ and runs this; by hand:
+#   docker compose -f deploy/compose.yaml --env-file deploy/generated/stack.env up -d --build
+# Host networking: SIP and RTP need no port mapping, and AudioSocket stays on
+# 127.0.0.1.
+
+name: v90modem
+
+services:
+  asterisk:
+    build:
+      context: ..
+      dockerfile: deploy/asterisk/Dockerfile
+    image: v90modem-asterisk
+    container_name: v90modem-asterisk
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./generated/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./generated/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./generated/rtp.conf:/etc/asterisk/rtp.conf:ro
+    logging:
+      options: {max-size: "20m", max-file: "3"}
+
+  pacer:
+    image: v90modem-answerer
+    pull_policy: never
+    container_name: v90modem-pacer
+    network_mode: host
+    restart: unless-stopped
+    depends_on: [answerer]
+    entrypoint: ["python3", "-u", "/opt/v90/audio_pace.py"]
+    environment:
+      PACE_LISTEN_PORT: "${PACER_PORT}"
+      PACE_TARGET_PORT: "${ANSWERER_PORT}"
+      PACE_EXACT: "1"
+      PACE_STEADY: "1"
+      PACE_GAP_MS: "400"
+      PACE_TX_LEAD: "5"
+    volumes:
+      - ../server-files/audio_pace.py:/opt/v90/audio_pace.py:ro
+    logging:
+      options: {max-size: "20m", max-file: "3"}
+
+  answerer:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: v90modem-answerer
+    container_name: v90modem-answerer
+    network_mode: host
+    restart: unless-stopped
+    env_file: ./generated/answerer.env
+    command: ["--listen", "127.0.0.1", "--port", "${ANSWERER_PORT}", "--v90", "--v34",
+              "--pppd", "/opt/v90/ppp-slirp.py",
+              "--local-ip", "10.0.2.2", "--peer-ip", "10.0.2.15", "--dns1", "10.0.2.3",
+              "--log-dir", "/var/log/v90", "--debug"]
+    volumes:
+      - ./logs:/var/log/v90
+    logging:
+      options: {max-size: "20m", max-file: "3"}

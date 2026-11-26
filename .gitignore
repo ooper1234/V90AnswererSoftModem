@@ -16,3 +16,5 @@ scripts/multilink/client.json
 /saved-builds/
 /docs/superpowers/
 *.orig
+/deploy/generated/
+/deploy/logs/
