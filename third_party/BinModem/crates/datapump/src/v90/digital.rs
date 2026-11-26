@@ -1405,6 +1405,14 @@ impl Modem {
     /// Begin a rate renegotiation from this end on a PCM upstream link
     /// (V.92 9.8.1.1; see `pcmup::Machine::renegotiate`). False on any other
     /// link or outside data mode.
+    /// Tell PCM upstream whether the echo canceller has locked on a path
+    /// back from this end (V92_PCM_ECHO unset or auto decides from it).
+    pub fn set_echo_path(&mut self, locked: bool) {
+        if let Some(p) = self.pcm.as_mut() {
+            p.set_echo_path(locked);
+        }
+    }
+
     pub fn renegotiate_pcm_up(&mut self, why: &str) -> bool {
         self.pcm.as_mut().is_some_and(|p| p.renegotiate(why))
     }

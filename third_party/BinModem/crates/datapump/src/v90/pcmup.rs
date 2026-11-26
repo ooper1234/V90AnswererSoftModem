@@ -65,14 +65,30 @@ const ECHO_RISE: f64 = 1.15;
 
 /// Whether to design for a line with this end's echo on it. V92_PCM_ECHO=1
 /// or 0 says so outright, for a line known to end in a hybrid or known not
-/// to; otherwise noise well over the first TRN1u's, heard with this end
-/// silent, is taken for the echo left after cancelling. That comparison
-/// is close on a line whose own noise grows with the signal.
-fn echo_on_line(quiet: Option<f64>, noise: f64) -> bool {
+/// to. Otherwise: an echo path the canceller locked on says so, and failing
+/// that, noise well over the first TRN1u's, heard with this end silent, is
+/// taken for the echo left after cancelling.
+///
+/// That comparison is close on a line whose own noise grows with the signal,
+/// and on a digital path it is fooled outright: the residual there is the
+/// caller's own u-law rounding, which grows with the level. 2026-11-26, a
+/// BinModem client over SIP (no echo: the canceller never locked, peak 0):
+/// TRN1u's residual 38 and TRN2u's 49.8, the same to the decimal on every
+/// call, so TRN2u read as echo and its design came out a step down, 41333
+/// against 42666. Hence [`Machine::echo_choice`]: decided once, on TRN1u.
+fn echo_on_line(quiet: Option<f64>, noise: f64, path: bool) -> bool {
+    match forced_echo() {
+        Some(on) => on,
+        None => path || quiet.is_some_and(|q| noise > ECHO_RISE * q),
+    }
+}
+
+/// V92_PCM_ECHO=1 or 0; anything else (or unset) decides per call.
+fn forced_echo() -> Option<bool> {
     match std::env::var("V92_PCM_ECHO").as_deref() {
-        Ok("1") => true,
-        Ok("0") => false,
-        _ => quiet.is_some_and(|q| noise > ECHO_RISE * q),
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
     }
 }
 /// Samples falling further than this many design sigmas from their points
@@ -337,6 +353,12 @@ pub(super) struct Machine {
     slips: usize,
     /// The first TRN1u's residual, heard while this end was silent.
     quiet_noise: Option<f64>,
+    /// The echo canceller has locked on a path back from this end's own
+    /// transmission (set by whoever runs the canceller; see `echo_on_line`).
+    echo_path: bool,
+    /// Whether the TRN1u design took the line for one with our echo on it:
+    /// TRN2u's design keeps the answer rather than asking again.
+    echo_choice: Option<bool>,
     /// The noise the design was made for, in codec units.
     design_sigma: f64,
     /// The design made from TRN2u in phase 4, while it is being worked out.
@@ -425,6 +447,8 @@ impl Machine {
             trn1d_at: None,
             design_rx: None,
             quiet_noise: None,
+            echo_path: false,
+            echo_choice: None,
             design_sigma: 0.0,
             design2_rx: None,
             phase4_at: 0,
@@ -669,9 +693,14 @@ impl Machine {
         let limits = Limits::from(&self.request);
         // Noise well over the first TRN1u's is our own echo left after
         // cancelling, with the codec's rounding of signal plus echo in it.
-        let echo = echo_on_line(self.quiet_noise, channel.noise);
+        let echo = echo_on_line(self.quiet_noise, channel.noise, self.echo_path);
+        self.echo_choice = Some(echo);
         if echo {
-            self.say("designing for a line with our echo on it");
+            self.say(if self.echo_path && forced_echo().is_none() {
+                "designing for a line with our echo on it (the canceller locked a path)"
+            } else {
+                "designing for a line with our echo on it"
+            });
         }
         let signs = design::trn1u_signs(TRAIN);
         self.design_rx = Some(Self::design_job(channel, heard, signs, law, limits, echo, self.margin_db));
@@ -964,6 +993,12 @@ impl Machine {
 
     /// Begin a rate renegotiation from data mode (9.8.1.1): Rd, R-bar-d and
     /// TRN2d go out, and Ru is waited for. False outside data mode.
+    /// Whether the echo canceller has locked on a path back from this end's
+    /// own transmission; see `echo_on_line`.
+    pub(super) fn set_echo_path(&mut self, locked: bool) {
+        self.echo_path = locked;
+    }
+
     pub(super) fn renegotiate(&mut self, why: &str) -> bool {
         if self.stage != Stage::Data {
             return false;
@@ -1089,7 +1124,12 @@ impl Machine {
             let channel = design::estimate(&heard, &sent, taps);
             let (at, peak) = channel.h.iter().enumerate().fold((0, 0.0f64), |m, (i, v)| if v.abs() > m.1 { (i, v.abs()) } else { m });
             self.say(format!("TRN2u measured: main tap {peak:.0} at {at} of {taps}, residual rms {:.1}", channel.noise.sqrt()));
-            let echo = echo_on_line(self.quiet_noise, channel.noise);
+            // Decided on TRN1u where it was (see `echo_on_line`); a path the
+            // canceller has locked on since still counts.
+            let echo = match (forced_echo(), self.echo_choice) {
+                (None, Some(choice)) => choice || self.echo_path,
+                _ => echo_on_line(self.quiet_noise, channel.noise, self.echo_path),
+            };
             if echo {
                 self.say("designing for a line with our echo on it");
             }

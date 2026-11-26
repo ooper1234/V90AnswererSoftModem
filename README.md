@@ -175,7 +175,7 @@ option on and `0` off.
 |---|---|---|
 | `V90_X2` | asked | Answer U.S. Robotics x2 callers (mu-law lines only) |
 | `V92_PCM_UPSTREAM` | asked | Offer V.92 PCM upstream |
-| `V92_PCM_ECHO` | follows PCM upstream | Echo canceller for PCM upstream |
+| `V92_PCM_ECHO` | `1` | `1`: design the upload for a line with echo (safe on every line). `auto`: decide per call from the echo canceller, faster on echo-free digital lines |
 | `V92_QUICK_CONNECT`, `V92_QC_ANSWER` | asked (Quick Connect) | Answer V.92 Quick Connect |
 | `V8BIS_ENABLE` | asked (V.8bis) | Answer with V.8bis signalling |
 | `V92_QC_V8BIS` | follows V.8bis | `0`: Quick Connect only after the answer tone, not inside V.8bis |

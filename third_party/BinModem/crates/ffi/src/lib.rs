@@ -3773,6 +3773,9 @@ fn start_error_control(&mut self) {
                 // first S-bar is late. The FIR fit excludes delay/tap warm-up
                 // rows and is judged against independent post-DIL samples.
                 self.echo.far_silent = m.echo_training_window() && (m.is_v90() || v34_echo_identify());
+                // PCM upstream's design asks whether our echo is on the line:
+                // a lock is the canceller's search finding a path back.
+                m.set_echo_path(self.echo.delay != 0);
                 self.echo.peer_silent = m.echo_training_settled();
                 self.echo.harm_judged = m.echo_judged();
                 // V.90 retrains in place, so C is handed no status for one

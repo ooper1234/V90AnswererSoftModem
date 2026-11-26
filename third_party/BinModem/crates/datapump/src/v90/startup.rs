@@ -693,6 +693,13 @@ impl Digital {
     }
 
     /// Begin a rate renegotiation from this end (V.92 PCM upstream data mode).
+    /// See `digital::Modem::set_echo_path`.
+    pub fn set_echo_path(&mut self, locked: bool) {
+        if let Some(m) = self.v90.as_mut() {
+            m.set_echo_path(locked);
+        }
+    }
+
     pub fn renegotiate_pcm_up(&mut self, why: &str) -> bool {
         self.v90.as_mut().is_some_and(|m| m.renegotiate_pcm_up(why))
     }
